@@ -209,6 +209,9 @@ class Report:
     changed   a line does not chain, a seal is not validly signed, or an epoch
               is missing: something was altered after it was written;
     unsealed  valid, but nothing is sealed yet;
+    pending   valid as far as files can show: some numbers are taken to be
+              in summaries the log announces (E19) but has not written yet,
+              which only the service can confirm;
     empty     no lines at all.
 
     A start hash given to the check that differs from the log's makes the
@@ -216,7 +219,8 @@ class Report:
 
     Numbers counted in a summary that is not written yet (AL-41) are in
     "pending": exactly, when the service said which summaries are open;
-    otherwise as far as the log itself announces them with E19.
+    otherwise as far as the log itself announces them with E19, and then
+    the result says so.
     """
 
     def __init__(self):
@@ -237,6 +241,7 @@ class Report:
         self.rekeys = 0
         self.pending = 0        # numbers in summaries not written yet
         self.pending_keys = []  # their class/id
+        self.confirmed = True   # pending as the service said, not inferred
 
     @property
     def result(self):
@@ -248,6 +253,8 @@ class Report:
             return "changed"
         if self.seals == 0:
             return "unsealed"
+        if self.pending and not self.confirmed:
+            return "pending"
         return "valid"
 
     def as_dict(self):
@@ -285,6 +292,7 @@ def verify(lines, start=None, open_summaries=None):
     """
     rep = Report()
     announced = {}          # E19 not yet followed by its summary entry
+    gaps = []               # (first, last) of numbers no entry carries
     rep.start_expected = start
     prev = ZERO
     pub = None
@@ -365,6 +373,8 @@ def verify(lines, start=None, open_summaries=None):
                 rep.problems.append((n, epoch, "sequence number %r out of order" % (seq,)))
                 epoch_ok = False
             else:
+                if seq > rep.last_seq + 1:
+                    gaps.append((rep.last_seq + 1, seq - 1))
                 rep.last_seq = seq
             rep.entries += 1
             rep.unsealed += 1
@@ -411,9 +421,22 @@ def verify(lines, start=None, open_summaries=None):
             rep.pending = held
             rep.pending_keys = [o.get("key", "") for o in open_summaries]
     elif short > 0 and announced and short >= len(announced):
-        # Each announced summary holds at least the number before its E19.
-        rep.pending = short
-        rep.pending_keys = sorted(set(announced.values()))
+        # Each announced summary holds at least the number before its E19,
+        # and none a number before its first. What is missing before the
+        # earliest of them has to be in the summaries written or declared
+        # lost; only the rest may be in the open ones.
+        firsts = [k for k in announced if isinstance(k, int)]
+        if firsts and len(firsts) == len(announced):
+            first = min(firsts)
+            before = sum(min(b, first - 1) - a + 1 for a, b in gaps if a < first)
+            explained = rep.aggregated + rep.lost
+            if before > explained:
+                rep.problems.append((rep.lines, epoch, "%d numbers missing before the first open summary (%d), "
+                                     "%d in summaries written or declared lost" % (before, first, explained)))
+        if not rep.problems:
+            rep.pending = short
+            rep.pending_keys = sorted(set(announced.values()))
+            rep.confirmed = False
     elif short != 0:
         rep.problems.append((rep.lines, epoch,
                              "%d events counted, %d numbered" % (rep.accounted, rep.last_seq)))

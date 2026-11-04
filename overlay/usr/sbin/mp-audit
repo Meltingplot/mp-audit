@@ -18,7 +18,8 @@ When the service is not running, record puts the entry into the journal,
 marked as queued, and the service takes it over when it starts (AL-35).
 
 Exit status: 0 done; 1 usage or the service is not reachable; 2 refused by
-the service; 3 the check did not find the log valid.
+the service; 3 the check did not find the log valid (a check of files that
+can only take open summaries on the log's word says "pending", exit 0).
 """
 
 import argparse
@@ -230,12 +231,12 @@ def cmd_verify(args):
         if rep.pending:
             print("open         %d %s in summaries not written yet (%s)%s" % (
                 rep.pending, "counted" if opened is not None else "at least", ", ".join(rep.pending_keys),
-                "" if opened is not None else "; the log announces them with E19"))
+                "" if opened is not None else "; announced by E19, only the device can confirm them"))
         if rep.torn:
             print("torn writes  %d" % rep.torn)
         for n, epoch, text in rep.problems:
             print("PROBLEM      line %d, epoch %d: %s" % (n, epoch, text))
-    return 0 if rep.result in ("valid", "unsealed") else 3
+    return 0 if rep.result in ("valid", "unsealed", "pending") else 3
 
 
 def cmd_genesis(args):

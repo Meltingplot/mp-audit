@@ -392,11 +392,25 @@ def test_open_summary():
     check("open: every number counted", core.next_seq - 1, rep.last_seq)
     check("open: the open summary holds the rest", core.summaries["attempt/E12"].n, rep.pending)
     rep = al.verify(lines, start)
-    check("open: valid from files, announced by E19", ("valid", ["attempt/E12"]), (rep.result, rep.pending_keys),
-          rep.problems[:2])
+    check("open: from files pending, announced by E19", ("pending", ["attempt/E12"]),
+          (rep.result, rep.pending_keys), rep.problems[:2])
     bad = [dict(o, n=o["n"] - 1) for o in opened]
     check("open: a summary short of a number is found", "changed", al.verify(lines, start, bad).result)
     check("open: a gap the service does not explain is found", "changed", al.verify(lines, start, []).result)
+    # Numbers handed out but never written before the summary opened: an
+    # open summary announced later cannot hold them.
+    d2, clk2, c2 = fresh()
+    c2.seal()
+    c2.record("E13", "done", actor="mpadmin")
+    c2.next_seq += 5
+    c2.record("E13", "done", actor="mpadmin")
+    flood_until_summary(c2)
+    c2.record("E13", "done", actor="mpadmin", msg="after the flood")
+    opened2, snap2 = c2.read_snapshot()
+    rep = al.verify(list(c2.lines(snap2)), c2.start)
+    check("open: from files, a gap before the open summary is found", "changed", rep.result,
+          rep.problems[:1])
+    shutil.rmtree(d2)
     # a restart keeps it open, and the check still holds
     core.close()
     clk.reboot(2)
