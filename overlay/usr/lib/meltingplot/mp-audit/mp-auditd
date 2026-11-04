@@ -12,7 +12,8 @@ auditcore.py; this file is what ties it to the computer:
 - the events of the computer itself: commissioning and installation (E01,
   E18), a new image and the outcome of its trial boot (E02), a boot that
   ended without a clean stop (E15), the system clock set or synchronised
-  (E16), faults of the log (E17);
+  (E16), faults of the log and stops of this service while the system runs
+  (E17);
 - entries queued in the journal while the service was not running (AL-35),
   and entries accepted but lost in a crash, which the journal still knows
   (AL-11);
@@ -52,6 +53,7 @@ INSTALLER = ENV("MP_AUDIT_INSTALLER", "/bootfs/meltingplot/installer.txt")
 COMMON = "/usr/lib/meltingplot/mp-common.sh"
 JOURNAL_SOCKET = ENV("MP_AUDIT_JOURNAL", "/run/systemd/journal/socket")
 JOURNALCTL = ENV("MP_AUDIT_JOURNALCTL", "journalctl")
+SYSTEMCTL = ENV("MP_AUDIT_SYSTEMCTL", "systemctl")
 CLOCK_JUMP = 60     # E16: a step of the system clock larger than this
 
 
@@ -407,7 +409,6 @@ class Service:
                              "kept": installer.get("kept", "")})
             start = self.core.genesis(data=data)
             log("audit log created, start hash %s" % start)
-            self.core.extra["image"] = self.pc.image()
         for kind, text in self.core.notes:
             self.record("E17", "failed" if kind in ("write", "rekey", "missing") else "info", text,
                         data={"kind": kind})
@@ -417,7 +418,9 @@ class Service:
             self.installation(installer, state)
         if state == "open":
             self.after_crash()
-            self.boot_events()
+        # Also when the log is new: it usually begins in the trial boot of
+        # the first image that has it, whose outcome belongs in it (E02).
+        self.boot_events(new=state == "new")
         self.import_queued()
         self.synced_once = self.core.extra.get("synced_bid") == self.core.bid
         self.core.flush()
@@ -455,9 +458,17 @@ class Service:
         self.record("E18", res, msg, obj=info.get("image", ""), data=data)
         self.core.extra["installer_sha"] = info["_sha"]
 
-    # E15, E17 and lost entries after a boot or a service that did not stop cleanly
+    # E15, E17 and lost entries after a boot or a service that did not stop
+    # cleanly; E17 also for a clean stop within this boot (AL-11, T36)
     def after_crash(self):
         core = self.core
+        if core.prev_clean and core.prev_bid and core.prev_bid == core.bid:
+            stop = core.prev_stop or {}
+            data = {"stopped": stop.get("t") or ""}
+            if isinstance(stop.get("op"), (int, float)):
+                data["gap"] = max(0, int(core.op() - stop["op"]))
+            self.record("E17", "info", "the audit service started again within this boot, %s s after its stop"
+                        % data.get("gap", "?"), data=data)
         if not core.prev_clean and core.prev_bid:
             if core.prev_bid != core.bid:
                 rsts = read_u32("/proc/device-tree/chosen/bootloader/rsts")
@@ -480,16 +491,30 @@ class Service:
                                 actor=e.get("actor", ""), via="journal", data=data)
 
     # E02: a new image, and the outcome of its trial boot
-    def boot_events(self):
+    def boot_events(self, new=False):
         cur = self.pc.image()
-        old = self.core.extra.get("image") or {}
-        trial = self.core.extra.get("trial")
-        if trial and not trial.get("done"):
-            if cur.get("version") == trial.get("from") and cur.get("slot") == trial.get("from_slot"):
-                self.record("E02", "failed", "trial boot of %s did not stay, back on %s" %
-                            (trial.get("to"), cur.get("version")),
+        extra = self.core.extra
+        if new:
+            # A new log knows no image yet, whatever a state file kept.
+            extra.pop("image", None)
+            extra.pop("trial", None)
+        old = extra.get("image") or {}
+        trial = extra.get("trial")
+        if trial:
+            if cur.get("version") == trial.get("to") and cur.get("slot") == trial.get("slot"):
+                # The image of the trial runs again. Committed while this
+                # service was not looking (the last minute of the trial boot,
+                # or by an image without the audit log); otherwise still on
+                # trial, and watched.
+                if self.pc.committed():
+                    extra.pop("trial", None)
+                    self.record("E02", "done", "image %s committed after its trial boot" % trial.get("to", ""),
+                                obj=trial.get("to", ""), data=trial)
+            else:
+                extra.pop("trial", None)
+                self.record("E02", "failed", "trial boot of %s in %s was not committed, now %s in %s" %
+                            (trial.get("to"), trial.get("slot"), cur.get("version"), cur.get("slot")),
                             obj=trial.get("to", ""), data=trial)
-            self.core.extra.pop("trial", None)
         if cur != old:
             tried = self.pc.trybooted()
             data = {"from": old.get("version", ""), "from_slot": old.get("slot", ""),
@@ -497,9 +522,11 @@ class Service:
             self.record("E02", "done", "image %s started in %s" % (cur.get("version"), cur.get("slot")),
                         obj=cur.get("name", ""), data=data)
             if tried:
-                self.core.extra["trial"] = data
-            self.core.extra["image"] = cur
-        self.trial = bool(self.core.extra.get("trial"))
+                extra["trial"] = data
+            else:
+                extra.pop("trial", None)
+            extra["image"] = cur
+        self.trial = bool(extra.get("trial"))
 
     def watch_trial(self):
         if not self.trial or time.monotonic() < self.next_trial_check:
@@ -536,6 +563,14 @@ class Service:
             if self.core is not None:
                 self.core.extra["synced_bid"] = self.core.bid
         self.last_off = off
+
+    @staticmethod
+    def system_state():
+        """What systemd says the system does: "stopping" while it takes the
+        system down, which stops this service as it should. Any other stop is
+        an intervention (T36)."""
+        _, out, _ = run([SYSTEMCTL, "is-system-running"], 10)
+        return out.strip() or "unknown"
 
     def import_queued(self):
         if self.core is None:
@@ -583,6 +618,12 @@ class Service:
             os.unlink(SOCK)
         except OSError:
             pass
+        system = self.system_state()
+        if system != "stopping":
+            # Written and sealed by the close below; the next start in this
+            # boot says how long the gap was.
+            self.record("E17", "info", "the audit service was stopped while the system runs",
+                        data={"system": system})
         if self.core is not None:
             self.core.close()
 
@@ -630,8 +671,11 @@ class Handler(socketserver.StreamRequestHandler):
                 if svc.core is None:
                     self.reply({"ok": False, "error": svc.reason})
                     return
-                self.reply({"ok": True, "start": svc.core.start})
-                for line in svc.core.lines():
+                # With the summaries still open at this moment, so a check
+                # accounts for every number (AL-41).
+                opened, snap = svc.core.read_snapshot()
+                self.reply({"ok": True, "start": svc.core.start, "open": opened})
+                for line in svc.core.lines(snap):
                     self.wfile.write(line.encode("utf-8", "surrogateescape") + b"\n")
             elif cmd == "seal":
                 if uid != 0 or svc.core is None:

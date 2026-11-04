@@ -251,6 +251,7 @@ class AuditCore:
         self.need_newline = False
         self.prev_clean = True
         self.prev_bid = None
+        self.prev_stop = {}
         self.lost = 0
         self.recovered = []
 
@@ -564,6 +565,7 @@ class AuditCore:
         self.bid = bid
         self.prev_clean = bool(st.get("clean"))
         self.prev_bid = st.get("bid")
+        self.prev_stop = {"t": st.get("saved", ""), "op": st.get("op")}
 
     def _scan(self, segs):
         """Read the lines after the known position into the counters."""
@@ -709,14 +711,18 @@ class AuditCore:
         self.journal(e, "counted in a summary")
         if ev != "E19":
             # One E19 per id and window (AL-43).
+            # "from" lets a check of the log tell the numbers of a summary
+            # that is still open from numbers that are missing.
             self.record("E19", "info", obj=key,
                         msg="%s over the budget of class %s, counted in a summary" % (ev, cls),
-                        data={"class": cls, "event": ev})
+                        data={"class": cls, "event": ev, "from": e["seq"]})
 
-    def _close_summaries(self, op):
+    def _close_summaries(self, op, force=False):
+        """Write the summaries that are due. With force all of them, whatever
+        the budget: the log they belong to ends (reset)."""
         for key in sorted(self.summaries):
             s = self.summaries[key]
-            if not s.due(op):
+            if not force and not s.due(op):
                 continue
             e = self._entry(s.ev, al.AGGREGATED, msg="%d events counted" % s.n)
             e["cls"] = s.cls
@@ -725,7 +731,7 @@ class AuditCore:
             last = s.window == len(WINDOWS) - 1
             if self.buckets[s.cls].take(cost, op):
                 pass
-            elif last:
+            elif last or force:
                 # After a day the summary is written whatever the budget says:
                 # it never waits longer (AL-41). Its fixed size keeps that
                 # within the share, see the test.
@@ -848,8 +854,23 @@ class AuditCore:
         with self.lock:
             return [(self._segpath(s), os.path.getsize(self._segpath(s))) for s in self.segments()]
 
-    def lines(self):
-        for path, size in self.snapshot():
+    def open_summaries(self):
+        """The summaries not written yet, in the form verify() takes: which
+        numbers they hold and how many."""
+        with self.lock:
+            return [{"key": k, "from": s.first, "to": s.last, "n": s.n}
+                    for k, s in sorted(self.summaries.items())]
+
+    def read_snapshot(self):
+        """The log and the open summaries at the same moment, for a check
+        that accounts for every number (AL-41): what was accepted is written
+        first, so each number is either on the disk or in a summary."""
+        with self.lock:
+            self.flush()
+            return self.open_summaries(), self.snapshot()
+
+    def lines(self, snap=None):
+        for path, size in (self.snapshot() if snap is None else snap):
             with open(path, "rb") as f:
                 data = f.read(size)
             for raw in data.split(b"\n"):
@@ -879,7 +900,14 @@ class AuditCore:
         archive/; the new one begins with E01 and an E18 that names the old
         start hash, last number and last hash, the reason and who asked."""
         with self.lock:
+            # What the open summaries counted belongs to the old log; it ends
+            # here, so they are written now, budget or not.
+            self._close_summaries(self.op(), force=True)
             self.close()
+            # The old log is final: the key its last seal announced must not
+            # stay, or it could be carried on unnoticed (AL-56).
+            self._wipe_keys_except(None)
+            self.key = None
             old = {"old_start": self.start, "old_seq": self.next_seq - 1, "old_hash": self.prev}
             boot, bid, op_base, extra = self.boot, self.bid, self.op_base, self.extra
             stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())

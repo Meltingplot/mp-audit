@@ -138,18 +138,20 @@ def cmd_record(args):
 
 
 def read_log(files):
-    """Lines from files, or from the service. Returns (lines, start)."""
+    """Lines from files, or from the service. Returns (lines, start, open
+    summaries); the last two only from the service."""
     if files:
         def gen():
             for path in files:
                 with open(path, "rb") as f:
                     for raw in f:
                         yield raw.decode("utf-8", "surrogateescape").rstrip("\n")
-        return gen(), None
+        return gen(), None, None
     reply, lines = request({"cmd": "read"}, stream=True)
     if not reply.get("ok"):
         raise Unreachable(reply.get("error", "refused"))
-    return lines, reply.get("start")
+    opened = reply.get("open")
+    return lines, reply.get("start"), opened if isinstance(opened, list) else None
 
 
 def short(text, n):
@@ -174,7 +176,7 @@ def format_entry(e):
 
 def cmd_show(args):
     try:
-        lines, _ = read_log(args.files)
+        lines, _, _ = read_log(args.files)
     except (Unreachable, OSError) as exc:
         print("mp-audit: %s" % exc, file=sys.stderr)
         return 1
@@ -204,11 +206,11 @@ def cmd_show(args):
 
 def cmd_verify(args):
     try:
-        lines, start = read_log(args.files)
+        lines, start, opened = read_log(args.files)
     except (Unreachable, OSError) as exc:
         print("mp-audit: %s" % exc, file=sys.stderr)
         return 1
-    rep = al.verify(lines, args.start)
+    rep = al.verify(lines, args.start, opened)
     if args.json:
         print(json.dumps(rep.as_dict(), indent=2, sort_keys=True))
     else:
@@ -225,6 +227,10 @@ def cmd_verify(args):
                                                                          rep.epochs_valid))
         print("open epoch   %d entries not sealed yet" % rep.unsealed)
         print("numbers      1..%d, %d counted in summaries, %d lost" % (rep.last_seq, rep.aggregated, rep.lost))
+        if rep.pending:
+            print("open         %d %s in summaries not written yet (%s)%s" % (
+                rep.pending, "counted" if opened is not None else "at least", ", ".join(rep.pending_keys),
+                "" if opened is not None else "; the log announces them with E19"))
         if rep.torn:
             print("torn writes  %d" % rep.torn)
         for n, epoch, text in rep.problems:

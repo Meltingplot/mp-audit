@@ -14,7 +14,12 @@ What matters (docs/meltingplot-audit-log.md):
   afterwards (AL-39 to AL-48), with bounded writes to the drive (AL-50);
 - strings from outside are bounded and stripped of control characters
   (AL-02), only root records (AL-10), the service takes over what was
-  queued in the journal (AL-35), a reset leaves a trace (AL-17).
+  queued in the journal (AL-35), a reset leaves a trace (AL-17) and a
+  closed old log behind;
+- a summary still open is no gap for the check (AL-41);
+- the image and the outcome of its trial boot are recorded also in the
+  boot that creates the log (E02), a stop of the service while the system
+  runs is recorded (E17, T36).
 """
 
 import json
@@ -330,14 +335,33 @@ def test_parallel():
     shutil.rmtree(d)
 
 
+def flood_until_summary(core, ev="E12", res="refused"):
+    """Records refused logins until their class is over budget and a summary
+    opens. Returns how many were sent."""
+    n = 0
+    while not core.summaries:
+        n += 1
+        core.record(ev, res, actor="user%d" % n, obj="10.0.0.%d" % (n % 250))
+    for i in range(100):
+        core.record(ev, res, actor="user%d" % (n + i), obj="10.0.1.%d" % i)
+    return n + 100
+
+
 def test_reset():
     d, clk, core = fresh()
     old = core.start
     core.record("E13", "done", actor="mpadmin")
+    flood_until_summary(core)
     new = core.reset("drive replaced in the lab", "mpadmin")
     check("reset: new start hash", True, new != old)
     archived = os.listdir(os.path.join(d, "archive"))
     check("reset: old log archived", 1, len(archived))
+    arch = os.path.join(d, "archive", archived[0])
+    with open(os.path.join(arch, "log", "00000001.jsonl")) as f:
+        rep = al.verify(f.read().splitlines(), old)
+    check("reset: old log closed, its open summary written", ("valid", 0, True),
+          (rep.result, rep.pending, rep.aggregated > 0), rep.problems[:2])
+    check("reset: no key of the old log left", [], os.listdir(os.path.join(arch, "keys")))
     e18 = [e for e in entries(core) if e["ev"] == "E18"]
     check("reset: E18 names the old log", old, e18[0]["data"]["old_start"] if e18 else None)
     check("reset: E18 names who and why", ("mpadmin", "drive replaced in the lab"),
@@ -347,6 +371,48 @@ def test_reset():
 
 
 # --- floods and budgets -------------------------------------------------------------
+
+def test_open_summary():
+    """A check while a summary is still open (after a flood it waits up to a
+    day) finds the log valid: from the service exactly, from files as far
+    as E19 announces it. Found on the bench panel with hmi rc.12."""
+    d, clk, core = fresh()
+    start = core.start
+    core.seal()
+    sent = flood_until_summary(core)
+    core.record("E13", "done", actor="mpadmin", msg="after the flood")
+    core.flush()
+    e19 = [e for e in entries(core) if e["ev"] == "E19"]
+    first = core.summaries["attempt/E12"].first
+    check("open: E19 names the first number of its summary", first, e19[0]["data"].get("from") if e19 else None)
+    opened, snap = core.read_snapshot()
+    lines = list(core.lines(snap))
+    rep = al.verify(lines, start, opened)
+    check("open: valid with the open summaries from the service", ("valid", []), (rep.result, rep.problems[:2]))
+    check("open: every number counted", core.next_seq - 1, rep.last_seq)
+    check("open: the open summary holds the rest", core.summaries["attempt/E12"].n, rep.pending)
+    rep = al.verify(lines, start)
+    check("open: valid from files, announced by E19", ("valid", ["attempt/E12"]), (rep.result, rep.pending_keys),
+          rep.problems[:2])
+    bad = [dict(o, n=o["n"] - 1) for o in opened]
+    check("open: a summary short of a number is found", "changed", al.verify(lines, start, bad).result)
+    check("open: a gap the service does not explain is found", "changed", al.verify(lines, start, []).result)
+    # a restart keeps it open, and the check still holds
+    core.close()
+    clk.reboot(2)
+    c2 = new_core(d, clk)
+    c2.open()
+    opened, snap = c2.read_snapshot()
+    check("open: still valid after a restart", "valid", al.verify(list(c2.lines(snap)), start, opened).result)
+    for _ in range(2 * 24 * 60):
+        clk.advance(60)
+        c2.tick()
+    c2.close()
+    rep = al.verify(lines_of(c2), start, c2.open_summaries())
+    check("open: once written, nothing pending", ("valid", 0, [], True),
+          (rep.result, rep.pending, c2.open_summaries(), rep.aggregated >= sent - 3000), rep.aggregated)
+    shutil.rmtree(d)
+
 
 def summary_max():
     s = ac.Summary(al.ATTEMPT, "E10", 0)
@@ -469,6 +535,98 @@ def test_clock():
 
 # --- the service and the command line ------------------------------------------------
 
+# --- the image and its trial boot (E02) ----------------------------------------------
+
+def load_daemon():
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("mp_auditd", DAEMON)
+    spec = importlib.util.spec_from_loader("mp_auditd", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class FakePC:
+    def __init__(self, version, slot, tried=False, committed=False):
+        self.version, self.slot, self.tried, self.done = version, slot, tried, committed
+
+    def image(self):
+        return {"name": "mp-hmi-pi5", "version": self.version, "slot": self.slot}
+
+    def trybooted(self):
+        return self.tried
+
+    def committed(self):
+        return self.done
+
+
+def test_trial():
+    D = load_daemon()
+
+    def service(core, pc):
+        svc = D.Service()
+        svc.core, svc.pc, svc.mode = core, pc, "log"
+        return svc
+
+    def e02(core):
+        core.flush()
+        return [(e["res"], e["msg"]) for e in entries(core) if e["ev"] == "E02"]
+
+    # The log begins in the trial boot of the first image that has it (the
+    # bench panel, OTA from hmi rc.11 to rc.12).
+    d, clk, core = fresh()
+    pc = FakePC("0.1.0-rc.12", "system_b", tried=True)
+    svc = service(core, pc)
+    svc.boot_events(new=True)
+    got = e02(core)
+    check("trial: a new log records its image", [("done", "image 0.1.0-rc.12 started in system_b")], got)
+    check("trial: ... started as a trial", True, core.extra.get("trial", {}).get("tryboot"))
+    pc.done = True
+    svc.watch_trial()
+    check("trial: and the commit", ("done", "image 0.1.0-rc.12 committed after its trial boot"),
+          e02(core)[-1] if e02(core) else None)
+    shutil.rmtree(d)
+
+    # Committed in the last minute of the trial boot, before the service saw it.
+    d, clk, core = fresh()
+    service(core, FakePC("0.1.0-rc.12", "system_b", tried=True)).boot_events(new=True)
+    clk.reboot(2)
+    svc = service(core, FakePC("0.1.0-rc.12", "system_b", committed=True))
+    svc.boot_events()
+    check("trial: a commit seen only at the next start", ("done", "image 0.1.0-rc.12 committed after its trial boot"),
+          e02(core)[-1] if e02(core) else None)
+    check("trial: ... is not a new image", 2, len(e02(core)))
+    shutil.rmtree(d)
+
+    # Rolled back to an image without the audit log, then the next update.
+    d, clk, core = fresh()
+    service(core, FakePC("0.1.0-rc.12", "system_b", tried=True)).boot_events(new=True)
+    clk.reboot(2)
+    svc = service(core, FakePC("0.1.0-rc.13", "system_a", tried=True))
+    svc.boot_events()
+    got = e02(core)
+    check("trial: a trial that did not stay, when the log comes back", ("failed",
+          "trial boot of 0.1.0-rc.12 in system_b was not committed, now 0.1.0-rc.13 in system_a"),
+          got[1] if len(got) > 1 else None)
+    check("trial: ... then the new image", ("done", "image 0.1.0-rc.13 started in system_a"),
+          got[2] if len(got) > 2 else None)
+    shutil.rmtree(d)
+
+    # Rolled back to the image before, which has the log (as before the fix).
+    d, clk, core = fresh()
+    svc = service(core, FakePC("0.1.0-rc.12", "system_b"))
+    svc.boot_events(new=True)
+    svc = service(core, FakePC("0.1.0-rc.13", "system_a", tried=True))
+    svc.boot_events()
+    clk.reboot(2)
+    service(core, FakePC("0.1.0-rc.12", "system_b")).boot_events()
+    check("trial: back on the image before", [("failed",
+          "trial boot of 0.1.0-rc.13 in system_a was not committed, now 0.1.0-rc.12 in system_b"),
+          ("done", "image 0.1.0-rc.12 started in system_b")], e02(core)[-2:])
+    shutil.rmtree(d)
+
+
 def cli(env, *args):
     p = subprocess.run([sys.executable, "-I", "-B", CLI] + list(args), env=env,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
@@ -490,6 +648,13 @@ def test_service():
     with open(stub, "w") as f:
         f.write("#!/bin/sh\nexit 0\n")
     os.chmod(stub, 0o755)
+    sysstate = os.path.join(tmp, "system-state")
+    with open(sysstate, "w") as f:
+        f.write("running\n")
+    systemctl = os.path.join(tmp, "systemctl")
+    with open(systemctl, "w") as f:
+        f.write("#!/bin/sh\ncat '%s'\n" % sysstate)
+    os.chmod(systemctl, 0o755)
     jsock = os.path.join(tmp, "journal.sock")
     journal = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     journal.bind(jsock)
@@ -498,7 +663,7 @@ def test_service():
                MP_DEVICE_CONF=os.path.join(tmp, "device.conf"),
                MP_IDENTITY_FILE=os.path.join(tmp, "identity"),
                MP_AUDIT_INSTALLER=os.path.join(tmp, "installer.txt"),
-               MP_AUDIT_JOURNAL=jsock, MP_AUDIT_JOURNALCTL=stub,
+               MP_AUDIT_JOURNAL=jsock, MP_AUDIT_JOURNALCTL=stub, MP_AUDIT_SYSTEMCTL=systemctl,
                MP_AUDIT_SOCKET=os.path.join(run, "socket"))
     env.pop("NOTIFY_SOCKET", None)
 
@@ -523,6 +688,7 @@ def test_service():
     check("service: E18 says what the card found", "installation over layout gen2, no earlier audit log",
           e18.get("msg"))
     check("service: machine from the identity", "chx-350-001", e18.get("mach"))
+    check("service: the first start records the image (E02)", "E02", evs[2] if len(evs) > 2 else None)
     if os.geteuid() != 0:
         rc, _, err = cli(env, "record", "E10", "refused", "--actor", "1-1")
         check("service: only root records", 2, rc)
@@ -532,17 +698,33 @@ def test_service():
     p.wait(timeout=30)
     check("service: clean stop", 0, p.returncode)
 
+    def msgs():
+        rc, out, _ = cli(env, "show", "--all", "--json")
+        return [(json.loads(x)["ev"], json.loads(x).get("msg", "")) for x in out.splitlines()]
+
+    # T36: a stop while the system runs is recorded when it happens, and the
+    # start after it within the same boot says how long the gap was
+    stopped = ("E17", "the audit service was stopped while the system runs")
     p = start()
-    rc, out, _ = cli(env, "show", "--all", "--json")
-    evs = [json.loads(x)["ev"] for x in out.splitlines()]
-    check("service: a clean restart adds no E15/E17", True, evs[:2] == ["E01", "E18"] and "E15" not in evs and "E17" not in evs,
-          " ".join(evs))
+    got = msgs()
+    again = [m for e, m in got if e == "E17" and m.startswith("the audit service started again within this boot")]
+    check("service: a stop while the system runs is an E17", 1, got.count(stopped), [e for e, _ in got])
+    check("service: the start after it in the same boot too, no E15", (1, False),
+          (len(again), any(e == "E15" for e, _ in got)))
+    with open(sysstate, "w") as f:
+        f.write("stopping\n")
+    p.send_signal(signal.SIGTERM)
+    p.wait(timeout=30)
+    p = start()
+    check("service: a stop at shutdown adds no E17", 1, msgs().count(stopped))
+    with open(sysstate, "w") as f:
+        f.write("running\n")
     p.kill()
     p.wait()
     p = start()
-    rc, out, _ = cli(env, "show", "--all", "--json")
-    evs = [json.loads(x)["ev"] for x in out.splitlines()]
-    check("service: a killed service is an E17 at the next start", True, "E17" in evs, " ".join(evs))
+    got = msgs()
+    check("service: a killed service is an E17 at the next start", True,
+          ("E17", "the audit service was restarted without a clean stop") in got, [e for e, _ in got])
     rc, out, _ = cli(env, "verify", "--start", st.get("start", ""))
     check("service: still valid after the kill", 0, rc)
     p.send_signal(signal.SIGTERM)
@@ -568,8 +750,8 @@ def test_service():
 
 def main():
     for t in (test_chain, test_tamper, test_restart, test_crash, test_lost_key, test_strings,
-              test_parallel, test_reset, test_budget_design, test_flood, test_wear, test_clock,
-              test_service):
+              test_parallel, test_reset, test_open_summary, test_budget_design, test_flood, test_wear,
+              test_clock, test_trial, test_service):
         t()
     sys.exit(failed)
 
