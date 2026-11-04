@@ -1,0 +1,35 @@
+[Unit]
+Description=Meltingplot audit log
+Documentation=https://github.com/Meltingplot/rpi-image-gen/blob/meltingplot/docs/meltingplot-audit-log.md
+# Early, so the services that change or open the computer find it running.
+# What happens before, the guards queue in the journal (AL-35).
+DefaultDependencies=no
+After=local-fs.target systemd-journald.socket mp-identity.service mp-hostname.service
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+# No condition: without the audit partition (layout gen1 or gen2) it still
+# runs, writes to the journal only and says so on every boot (AL-36).
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/lib/meltingplot/mp-audit/mp-auditd
+# The audit partition is mounted in this namespace only (AL-04, AL-34):
+# everyone else sees an empty directory, and nothing finds it in the fstab.
+PrivateMounts=yes
+RuntimeDirectory=mp-audit
+RuntimeDirectoryMode=0755
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+# A stop as root is possible; the next start finds the boot without a clean
+# end and records it (AL-11). A crash restarts it.
+Restart=always
+RestartSec=2
+# e2fsck on a large partition, at worst
+TimeoutStartSec=300
+TimeoutStopSec=60
+WatchdogSec=60
+
+[Install]
+WantedBy=sysinit.target

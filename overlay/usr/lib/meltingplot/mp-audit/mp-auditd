@@ -1,0 +1,701 @@
+#!/usr/bin/python3 -I
+"""mp-auditd: the audit log service of a Meltingplot printer computer.
+
+Requirements: docs/meltingplot-audit-log.md (AL-nn). Runs as mp-audit.service
+in a mount namespace of its own (PrivateMounts=yes): the audit partition is
+mounted there and nowhere else (AL-04, AL-34). Entries arrive over a socket,
+from root only; the group adm may read (AL-10). The logic of the log is in
+auditcore.py; this file is what ties it to the computer:
+
+- mounting the partition, formatting it only when it carries no filesystem
+  at all, never when it is damaged (AL-37);
+- the events of the computer itself: commissioning and installation (E01,
+  E18), a new image and the outcome of its trial boot (E02), a boot that
+  ended without a clean stop (E15), the system clock set or synchronised
+  (E16), faults of the log (E17);
+- entries queued in the journal while the service was not running (AL-35),
+  and entries accepted but lost in a crash, which the journal still knows
+  (AL-11);
+- without an audit partition (layout gen1 or gen2) it keeps the socket, puts
+  every entry into the journal only and says so on every boot (AL-36).
+"""
+
+import grp
+import hashlib
+import json
+import os
+import signal
+import socket
+import socketserver
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+import auditcore as ac   # noqa: E402
+import auditlog as al    # noqa: E402
+
+# The environment only serves the tests on the build host: there the log
+# lives in a plain directory (MP_AUDIT_STORE) instead of on the partition.
+ENV = os.environ.get
+DEV = "/dev/disk/by-slot/audit"
+RUN = ENV("MP_AUDIT_RUN", "/run/mp-audit")
+STORE = os.path.join(RUN, "store")
+TEST_STORE = ENV("MP_AUDIT_STORE")
+SOCK = os.path.join(RUN, "socket")
+DEVICE_CONF = ENV("MP_DEVICE_CONF", "/etc/meltingplot/device.conf")
+IDENTITY = ENV("MP_IDENTITY_FILE", "/persistent/common/etc/mp-identity")
+INSTALLER = ENV("MP_AUDIT_INSTALLER", "/bootfs/meltingplot/installer.txt")
+COMMON = "/usr/lib/meltingplot/mp-common.sh"
+JOURNAL_SOCKET = ENV("MP_AUDIT_JOURNAL", "/run/systemd/journal/socket")
+JOURNALCTL = ENV("MP_AUDIT_JOURNALCTL", "journalctl")
+CLOCK_JUMP = 60     # E16: a step of the system clock larger than this
+
+
+def log(msg):
+    print("mp-auditd: " + msg, file=sys.stderr, flush=True)
+
+
+# --- journal (AL-08) -------------------------------------------------------------
+
+def journal_send(message, priority=6, **fields):
+    parts = []
+
+    def add(key, value):
+        v = str(value).encode("utf-8", "replace")
+        if b"\n" in v:
+            parts.append(key.encode() + b"\n" + struct.pack("<Q", len(v)) + v + b"\n")
+        else:
+            parts.append(key.encode() + b"=" + v + b"\n")
+
+    add("MESSAGE", message)
+    add("PRIORITY", priority)
+    add("SYSLOG_IDENTIFIER", "mp-audit")
+    for k, v in fields.items():
+        add(k, v)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.sendto(b"".join(parts), JOURNAL_SOCKET)
+    except OSError:
+        print(message, file=sys.stderr, flush=True)
+
+
+def describe(e):
+    text = "%s %s" % (e.get("ev"), e.get("res"))
+    if e.get("msg"):
+        text += ": " + e["msg"]
+    if e.get("obj"):
+        text += " [%s]" % e["obj"]
+    if e.get("actor"):
+        text += " (%s)" % e["actor"]
+    return text
+
+
+def mirror(e, note=None):
+    """Every entry goes to the journal at once, with its number, so it can
+    be seen live and so a crash before it reached the partition still shows
+    what was lost (AL-08, AL-11). Only the audit log is the proof."""
+    if e.get("res") in ("refused", "failed") or e.get("ev") == "E17":
+        prio = 4
+    else:
+        prio = 6
+    text = describe(e) + (" - " + note if note else "")
+    journal_send(text, prio, MP_AUDIT_SEQ=e.get("seq", 0), MP_AUDIT_EV=e.get("ev"),
+                 MP_AUDIT_CLASS=e.get("cls"), MP_AUDIT_RESULT=e.get("res"),
+                 MP_AUDIT_ENTRY=al.canon(e))
+
+
+# --- the computer ------------------------------------------------------------------
+
+def conf(path):
+    out = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip().rstrip("\r")
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def read_text(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read().rstrip(b"\0\n").decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def read_u32(path):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(4)
+        return struct.unpack(">I", raw)[0] if len(raw) == 4 else None
+    except OSError:
+        return None
+
+
+def run(cmd, timeout=600):
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 127, "", str(exc)
+
+
+class Computer:
+    def __init__(self):
+        self.device = conf(DEVICE_CONF)
+
+    def ident(self):
+        idf = conf(IDENTITY)
+        serial = idf.get("PRINTER_SERIAL", "")
+        product = self.device.get("MP_PRODUCT", "unknown")
+        return {
+            "sys": self.device.get("MP_ROLE", "sbc"),
+            "host": socket.gethostname(),
+            "mach": "%s-%s" % (product, serial) if serial else "unprovisioned",
+            "img": self.device.get("MP_VERSION", "") or "unknown",
+        }
+
+    @staticmethod
+    def slot():
+        """GPT name of the partition the root filesystem comes from, through
+        a device mapper target if there is one."""
+        try:
+            st = os.stat("/")
+        except OSError:
+            return "unknown"
+        base = "/sys/dev/block/%d:%d" % (os.major(st.st_dev), os.minor(st.st_dev))
+        devices = [base]
+        slaves = os.path.join(base, "slaves")
+        if os.path.isdir(slaves):
+            devices += [os.path.join(slaves, n) for n in sorted(os.listdir(slaves))]
+        for dev in devices:
+            for line in read_text(os.path.join(dev, "uevent")).splitlines():
+                if line.startswith("PARTNAME="):
+                    return line[len("PARTNAME="):].lower()
+        return "unknown"
+
+    def image(self):
+        return {"name": self.device.get("MP_IMAGE", ""), "version": self.device.get("MP_VERSION", ""),
+                "slot": self.slot()}
+
+    @staticmethod
+    def trybooted():
+        return read_u32("/proc/device-tree/chosen/bootloader/tryboot") == 1
+
+    @staticmethod
+    def committed():
+        rc, _, _ = run(["sh", "-c", ". %s && mp_slot_committed" % COMMON], 30)
+        return rc == 0
+
+    def identity_data(self, dev):
+        idf = conf(IDENTITY)
+        data = {"serial": idf.get("PRINTER_SERIAL", ""),
+                "board": read_text("/proc/device-tree/serial-number"),
+                "product": self.device.get("MP_PRODUCT", ""),
+                "image": self.device.get("MP_IMAGE", "")}
+        if dev:
+            rc, pk, _ = run(["lsblk", "-ndo", "PKNAME", dev], 10)
+            if rc == 0 and pk:
+                model = read_text("/sys/block/%s/device/model" % pk).strip()
+                serial = read_text("/sys/block/%s/device/serial" % pk).strip()
+                data["drive"] = ("%s %s" % (model, serial)).strip()
+        return data
+
+
+# --- the partition (AL-04, AL-34, AL-36, AL-37) -----------------------------------
+
+def mounted_elsewhere(dev):
+    """Whether the partition is mounted in the namespace everyone else sees.
+    Only root can do that, and it is worth an entry."""
+    try:
+        st = os.stat(dev)
+        mm = "%d:%d" % (os.major(st.st_rdev), os.minor(st.st_rdev))
+        with open("/proc/1/mountinfo") as f:
+            return any(line.split()[2] == mm for line in f)
+    except (OSError, IndexError):
+        return False
+
+
+def mount_store(notes):
+    """Mount the partition in this namespace. Returns the directory, or None
+    with the reason in notes."""
+    if TEST_STORE:
+        return TEST_STORE, None
+    if not os.path.exists(DEV):
+        notes.append(("E17", "failed", "no audit partition (layout gen1 or gen2): "
+                      "this computer has to be moved to layout gen3 with the installer card", {}))
+        return None, None
+    dev = os.path.realpath(DEV)
+    rc, fstype, _ = run(["blkid", "-p", "-o", "value", "-s", "TYPE", dev], 30)
+    if rc == 2:
+        # Nothing at all on it: a first start after an installation that did
+        # not bring a filesystem. Anything else is left as it is.
+        rc, _, err = run(["mkfs.ext4", "-q", "-L", "AUDIT", dev])
+        if rc != 0:
+            notes.append(("E17", "failed", "cannot format the empty audit partition: " + err, {}))
+            return None, dev
+        notes.append(("E17", "info", "empty audit partition formatted", {}))
+    elif rc != 0 or fstype != "ext4":
+        notes.append(("E17", "failed", "audit partition holds %r, not ext4; left as it is" % fstype, {}))
+        return None, dev
+    if mounted_elsewhere(dev):
+        notes.append(("E17", "failed", "audit partition is mounted outside the audit service", {}))
+    else:
+        rc, _, err = run(["e2fsck", "-p", dev])
+        if rc >= 4:
+            # Damaged: it may be the proof, so it is never repaired by force
+            # or formatted (AL-37).
+            notes.append(("E17", "failed", "audit partition damaged (e2fsck %d), left as it is: %s" % (rc, err[:120]), {}))
+            return None, dev
+        if rc:
+            notes.append(("E17", "info", "e2fsck repaired the audit partition (%d)" % rc, {}))
+    os.makedirs(STORE, mode=0o700, exist_ok=True)
+    try:
+        sys_mount(dev, STORE)
+    except OSError as exc:
+        notes.append(("E17", "failed", "cannot mount the audit partition: %s" % exc, {}))
+        return None, dev
+    return STORE, dev
+
+
+def sys_mount(dev, target):
+    """mount(2) itself: mount(8) would record the mount in /run/mount/utab,
+    which is read-only for this service and must not name a mount that
+    exists only in its namespace."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    ms_nosuid, ms_nodev, ms_noexec, ms_noatime = 2, 4, 8, 1024
+    flags = ms_nosuid | ms_nodev | ms_noexec | ms_noatime
+    if libc.mount(dev.encode(), target.encode(), b"ext4", flags, None) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+
+# --- the journal: queued and lost entries (AL-35, AL-11) ---------------------------
+
+def journal_json(args):
+    rc, out, _ = run([JOURNALCTL, "--no-pager", "-o", "json"] + args, 120)
+    if rc != 0:
+        return []
+    items = []
+    for line in out.splitlines():
+        try:
+            items.append(json.loads(line))
+        except ValueError:
+            pass
+    return items
+
+
+def queued_records(cursor, bid):
+    """Entries that mp-audit record put into the journal while the service
+    was not there, oldest first, and the cursor after the last."""
+    args = ["MP_AUDIT_PENDING=1"]
+    if cursor:
+        args += ["--after-cursor", cursor]
+    else:
+        args += ["_BOOT_ID=" + bid]
+    items = journal_json(args)
+    last = cursor
+    out = []
+    for it in items:
+        last = it.get("__CURSOR", last)
+        if it.get("_UID") != "0":
+            continue        # entries come from root only (AL-10)
+        try:
+            req = json.loads(it.get("MP_AUDIT_REQ", ""))
+        except ValueError:
+            continue
+        if isinstance(req, dict):
+            out.append((req, it.get("_COMM", "")))
+    return out, last
+
+
+def lost_in_crash(bid, after):
+    """Entries the service accepted and mirrored into the journal in a boot
+    that ended in a crash, numbered from after on.
+
+    Only what this service wrote counts: the unit and the user id are fields
+    journald sets itself from the sender, while any process can name itself
+    mp-audit and put whatever it likes into the other fields. One entry per
+    number, the first."""
+    seen = {}
+    for it in journal_json(["_BOOT_ID=" + bid, "_SYSTEMD_UNIT=mp-audit.service", "_UID=0"]):
+        if it.get("_SYSTEMD_UNIT") != "mp-audit.service" or it.get("_UID") != "0":
+            continue
+        try:
+            seq = int(it.get("MP_AUDIT_SEQ", "0"))
+            e = json.loads(it.get("MP_AUDIT_ENTRY", ""))
+        except ValueError:
+            continue
+        if seq >= after and isinstance(e, dict) and e.get("seq") == seq and seq not in seen:
+            seen[seq] = e
+    return sorted(seen.items())
+
+
+# --- the service ---------------------------------------------------------------------
+
+class Service:
+    def __init__(self):
+        self.pc = Computer()
+        self.core = None
+        self.mode = "starting"
+        self.reason = ""
+        self.stop = threading.Event()
+        self.last_off = None
+        self.synced_once = False
+        self.trial = False
+        self.next_trial_check = 0
+
+    # entries of the service itself, also without a partition
+    def record(self, ev, res, msg="", obj="", actor="", via="mp-auditd", data=None, sync=False, force=False):
+        if self.core is not None:
+            try:
+                return self.core.record(ev, res, actor=actor, via=via, obj=obj, msg=msg,
+                                        data=data, sync=sync, force=force)
+            except ValueError as exc:
+                log(str(exc))
+                return 0
+        e = {"ev": ev, "res": res, "cls": al.class_of(ev, res), "msg": al.clean(msg, 256)}
+        if obj:
+            e["obj"] = al.clean(obj, 256)
+        if actor:
+            e["actor"] = al.clean(actor, 64)
+        if data:
+            e["data"] = al.clean_data(data)
+        mirror(e, "journal only, " + self.reason)
+        return 0
+
+    def start(self):
+        notes = []
+        root, dev = mount_store(notes)
+        if root is None:
+            self.mode = "journal-only"
+            self.reason = notes[-1][2] if notes else "no audit partition"
+            for ev, res, msg, data in notes:
+                self.record(ev, res, msg, data=data)
+            return
+        self.core = ac.AuditCore(root, self.pc.ident, journal=mirror, append_only=not TEST_STORE)
+        try:
+            state = self.core.open(recover=lost_in_crash)
+        except Exception as exc:    # noqa: BLE001 - never a restart loop over the proof
+            self.core = None
+            self.mode = "journal-only"
+            self.reason = "audit log cannot be opened: %s" % exc
+            self.record("E17", "failed", self.reason)
+            for ev, res, msg, data in notes:
+                self.record(ev, res, msg, data=data)
+            return
+        self.mode = "log"
+        installer = self.installer()
+        if state == "new":
+            data = self.pc.identity_data(dev)
+            if installer:
+                data.update({"installer": installer.get("installer", ""),
+                             "installed": installer.get("installed", ""),
+                             "layout_before": installer.get("layout_before", ""),
+                             "kept": installer.get("kept", "")})
+            start = self.core.genesis(data=data)
+            log("audit log created, start hash %s" % start)
+            self.core.extra["image"] = self.pc.image()
+        for kind, text in self.core.notes:
+            self.record("E17", "failed" if kind in ("write", "rekey", "missing") else "info", text,
+                        data={"kind": kind})
+        for ev, res, msg, data in notes:
+            self.record(ev, res, msg, data=data)
+        if installer and installer.get("_sha") != self.core.extra.get("installer_sha"):
+            self.installation(installer, state)
+        if state == "open":
+            self.after_crash()
+            self.boot_events()
+        self.import_queued()
+        self.synced_once = self.core.extra.get("synced_bid") == self.core.bid
+        self.core.flush()
+        self.core.seal()
+        self.core.save_state()
+
+    # E18 (AL-18): what the installer card found on the drive
+    def installer(self):
+        try:
+            with open(INSTALLER, "rb") as f:
+                raw = f.read(4096)
+        except OSError:
+            return None
+        info = conf(INSTALLER)
+        info["_sha"] = hashlib.sha256(raw).hexdigest()
+        return info
+
+    def installation(self, info, state):
+        before = info.get("layout_before", "")
+        kept = info.get("kept", "") == "yes"
+        if kept and state == "open":
+            msg, res = "reinstallation, audit log kept", "done"
+        elif kept:
+            msg, res = "reinstallation, the kept audit partition held no readable log", "failed"
+        elif before in ("gen1", "gen2"):
+            msg, res = "installation over layout %s, no earlier audit log" % before, "done"
+        elif before == "gen3":
+            msg, res = "installation over layout gen3 without keeping its audit log", "done"
+        elif before == "blank":
+            msg, res = "installation on an empty drive", "done"
+        else:
+            msg, res = "installation over a drive with layout %r" % (before or "unknown"), "done"
+        data = {k: info.get(k, "") for k in ("image", "sha256", "installer", "installed",
+                                            "layout_before", "keep_part", "kept", "drive")}
+        self.record("E18", res, msg, obj=info.get("image", ""), data=data)
+        self.core.extra["installer_sha"] = info["_sha"]
+
+    # E15, E17 and lost entries after a boot or a service that did not stop cleanly
+    def after_crash(self):
+        core = self.core
+        if not core.prev_clean and core.prev_bid:
+            if core.prev_bid != core.bid:
+                rsts = read_u32("/proc/device-tree/chosen/bootloader/rsts")
+                self.record("E15", "info", "the previous boot ended without a clean stop of the audit log",
+                            data={"boot": core.boot - 1, "rsts": "%08x" % rsts if rsts is not None else ""})
+            else:
+                self.record("E17", "failed", "the audit service was restarted without a clean stop")
+        if core.lost > 0:
+            seen = core.recovered
+            self.record("E17", "failed",
+                        "%d entries accepted before the crash did not reach the audit partition; "
+                        "%d recovered from the journal" % (core.lost, len(seen)),
+                        data={"lost": core.lost, "recovered": len(seen)}, force=True)
+            for seq, e in seen:
+                data = dict(e.get("data") or {})
+                data.update({"orig_seq": seq, "orig_t": e.get("t", "")})
+                res = e.get("res") if e.get("res") in al.RESULTS else "info"
+                if e.get("ev") in al.EVENTS:
+                    self.record(e["ev"], res, e.get("msg", ""), obj=e.get("obj", ""),
+                                actor=e.get("actor", ""), via="journal", data=data)
+
+    # E02: a new image, and the outcome of its trial boot
+    def boot_events(self):
+        cur = self.pc.image()
+        old = self.core.extra.get("image") or {}
+        trial = self.core.extra.get("trial")
+        if trial and not trial.get("done"):
+            if cur.get("version") == trial.get("from") and cur.get("slot") == trial.get("from_slot"):
+                self.record("E02", "failed", "trial boot of %s did not stay, back on %s" %
+                            (trial.get("to"), cur.get("version")),
+                            obj=trial.get("to", ""), data=trial)
+            self.core.extra.pop("trial", None)
+        if cur != old:
+            tried = self.pc.trybooted()
+            data = {"from": old.get("version", ""), "from_slot": old.get("slot", ""),
+                    "to": cur.get("version", ""), "slot": cur.get("slot", ""), "tryboot": tried}
+            self.record("E02", "done", "image %s started in %s" % (cur.get("version"), cur.get("slot")),
+                        obj=cur.get("name", ""), data=data)
+            if tried:
+                self.core.extra["trial"] = data
+            self.core.extra["image"] = cur
+        self.trial = bool(self.core.extra.get("trial"))
+
+    def watch_trial(self):
+        if not self.trial or time.monotonic() < self.next_trial_check:
+            return
+        self.next_trial_check = time.monotonic() + 60
+        if self.pc.committed():
+            trial = self.core.extra.pop("trial", {})
+            self.record("E02", "done", "image %s committed after its trial boot" % trial.get("to", ""),
+                        obj=trial.get("to", ""), data=trial)
+            self.trial = False
+
+    # E16 (AL-27, AL-49): the system clock is only shown, and every step of it
+    # is an entry
+    def watch_clock(self):
+        boot = time.clock_gettime(time.CLOCK_BOOTTIME)
+        off = time.time() - boot
+        synced = ac.clock_synced()
+        jump = self.last_off is not None and abs(off - self.last_off) > CLOCK_JUMP
+        first_sync = synced and not self.synced_once
+        if jump or first_sync:
+            data = {"synced": synced}
+            if self.last_off is not None:
+                data["from"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.last_off + boot))
+                data["delta"] = int(off - self.last_off)
+            if first_sync and jump:
+                msg = "system clock synchronised, moved by %d s" % data["delta"]
+            elif first_sync:
+                msg = "system clock synchronised"
+            else:
+                msg = "system clock set, moved by %d s" % data["delta"]
+            self.record("E16", "done" if jump else "info", msg, data=data)
+        if synced and not self.synced_once:
+            self.synced_once = True
+            if self.core is not None:
+                self.core.extra["synced_bid"] = self.core.bid
+        self.last_off = off
+
+    def import_queued(self):
+        if self.core is None:
+            return
+        cursor = self.core.extra.get("jcursor")
+        items, last = queued_records(cursor, self.core.bid)
+        for req, comm in items:
+            ev, res = req.get("ev"), req.get("res")
+            if ev not in al.EVENTS or res not in al.RESULTS:
+                continue
+            data = dict(req.get("data") or {})
+            data["queued"] = req.get("t", "")
+            self.record(ev, res, req.get("msg", ""), obj=req.get("obj", ""), actor=req.get("actor", ""),
+                        via="journal:" + (req.get("via") or comm), data=data)
+        if last:
+            self.core.extra["jcursor"] = last
+
+    def status(self):
+        st = {"mode": self.mode, "reason": self.reason}
+        if self.core is not None:
+            st.update(self.core.status())
+            st["notes"] = len(self.core.notes)
+        return st
+
+    def run(self):
+        self.start()
+        sd_notify("READY=1\nSTATUS=" + ("audit log on its partition" if self.core else self.reason))
+        server = Server(SOCK, self)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        noted = len(self.core.notes) if self.core else 0
+        while not self.stop.wait(1):
+            if self.core is not None:
+                self.core.tick()
+                if len(self.core.notes) > noted:
+                    for kind, text in self.core.notes[noted:]:
+                        journal_send("audit log fault (%s): %s" % (kind, text), 3)
+                    noted = len(self.core.notes)
+                self.watch_trial()
+            self.watch_clock()
+            sd_notify("WATCHDOG=1")
+        sd_notify("STOPPING=1")
+        server.shutdown()
+        server.server_close()
+        try:
+            os.unlink(SOCK)
+        except OSError:
+            pass
+        if self.core is not None:
+            self.core.close()
+
+
+# --- the socket (AL-10, AL-34) -----------------------------------------------------
+
+def peer(sock):
+    raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    return struct.unpack("3i", raw)
+
+
+class Handler(socketserver.StreamRequestHandler):
+    def reply(self, obj):
+        self.wfile.write((json.dumps(obj, sort_keys=True) + "\n").encode())
+
+    def handle(self):
+        svc = self.server.svc
+        self.request.settimeout(10)
+        try:
+            pid, uid, _ = peer(self.request)
+            line = self.rfile.readline(65536)
+            req = json.loads(line)
+            if not isinstance(req, dict):
+                raise ValueError("not an object")
+        except (OSError, ValueError) as exc:
+            self.reply({"ok": False, "error": "bad request: %s" % exc})
+            return
+        cmd = req.get("cmd")
+        try:
+            if cmd == "record":
+                if uid != 0:
+                    self.reply({"ok": False, "error": "only root records"})
+                    return
+                if req.get("ev") not in al.EVENTS or req.get("res") not in al.RESULTS:
+                    self.reply({"ok": False, "error": "unknown event or result"})
+                    return
+                via = req.get("via") or read_text("/proc/%d/comm" % pid)
+                seq = svc.record(req.get("ev"), req.get("res"), msg=req.get("msg", ""),
+                                 obj=req.get("obj", ""), actor=req.get("actor", ""), via=via,
+                                 data=req.get("data"), sync=bool(req.get("sync")))
+                self.reply({"ok": True, "seq": seq, "mode": svc.mode})
+            elif cmd == "status":
+                self.reply(dict(svc.status(), ok=True))
+            elif cmd == "read":
+                if svc.core is None:
+                    self.reply({"ok": False, "error": svc.reason})
+                    return
+                self.reply({"ok": True, "start": svc.core.start})
+                for line in svc.core.lines():
+                    self.wfile.write(line.encode("utf-8", "surrogateescape") + b"\n")
+            elif cmd == "seal":
+                if uid != 0 or svc.core is None:
+                    self.reply({"ok": False, "error": "not possible"})
+                    return
+                svc.core.seal()
+                self.reply({"ok": True})
+            elif cmd == "reset":
+                reason = al.clean(req.get("reason", ""), 200).strip()
+                if uid != 0 or svc.core is None or not reason:
+                    self.reply({"ok": False, "error": "a reset needs root, the audit partition and a reason"})
+                    return
+                start = svc.core.reset(reason, req.get("actor", "") or "uid 0",
+                                       data=svc.pc.identity_data(None))
+                self.reply({"ok": True, "start": start, "fingerprint": al.fingerprint(start)})
+            else:
+                self.reply({"ok": False, "error": "unknown command %r" % cmd})
+        except ValueError as exc:
+            self.reply({"ok": False, "error": str(exc)})
+        except OSError:
+            pass
+
+
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+    def __init__(self, path, svc):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        old = os.umask(0o117)
+        try:
+            super().__init__(path, Handler)
+        finally:
+            os.umask(old)
+        try:
+            os.chown(path, 0, grp.getgrnam("adm").gr_gid)
+        except (KeyError, OSError):
+            pass
+        os.chmod(path, 0o660)
+        self.svc = svc
+
+
+def sd_notify(msg):
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.sendto(msg.encode(), addr)
+    except OSError:
+        pass
+
+
+def main():
+    os.makedirs(RUN, exist_ok=True)
+    svc = Service()
+    signal.signal(signal.SIGTERM, lambda *_: svc.stop.set())
+    signal.signal(signal.SIGINT, lambda *_: svc.stop.set())
+    svc.run()
+
+
+if __name__ == "__main__":
+    main()

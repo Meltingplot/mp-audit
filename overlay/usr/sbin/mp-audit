@@ -1,0 +1,329 @@
+#!/usr/bin/python3 -I
+"""mp-audit: record, show and check the audit log of this computer.
+
+  mp-audit record EVENT RESULT [--actor A] [--obj O] [--msg M] [--data K=V]... [--sync]
+  mp-audit show [--all] [--seals] [--ev ID]... [--json] [FILE...]
+  mp-audit verify [--start HASH] [--json] [FILE...]
+  mp-audit genesis
+  mp-audit status [--json]
+  mp-audit reset --reason TEXT
+
+Requirements: docs/meltingplot-audit-log.md. Recording takes root (AL-10);
+showing and checking take root or the group adm, which the Connect account
+is in (AL-20). Given files, show and verify read those instead of asking the
+service, for instance an exported log on another computer, where this script
+and auditlog.py next to it are all it takes besides python3-cryptography.
+
+When the service is not running, record puts the entry into the journal,
+marked as queued, and the service takes it over when it starts (AL-35).
+
+Exit status: 0 done; 1 usage or the service is not reachable; 2 refused by
+the service; 3 the check did not find the log valid.
+"""
+
+import argparse
+import json
+import os
+import socket
+import struct
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+for _lib in (os.path.join(HERE, "..", "lib", "meltingplot", "mp-audit"), HERE):
+    if os.path.exists(os.path.join(_lib, "auditlog.py")):
+        sys.path.insert(0, os.path.realpath(_lib))
+        break
+
+import auditlog as al   # noqa: E402
+
+SOCK = os.environ.get("MP_AUDIT_SOCKET", "/run/mp-audit/socket")
+JOURNAL_SOCKET = os.environ.get("MP_AUDIT_JOURNAL", "/run/systemd/journal/socket")
+
+
+class Unreachable(Exception):
+    pass
+
+
+def request(req, stream=False):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(30)
+    try:
+        s.connect(SOCK)
+    except OSError as exc:
+        s.close()
+        raise Unreachable(str(exc))
+    f = s.makefile("rwb")
+    f.write((json.dumps(req) + "\n").encode())
+    f.flush()
+    s.shutdown(socket.SHUT_WR)
+    head = f.readline()
+    if not head:
+        s.close()
+        raise Unreachable("no answer")
+    reply = json.loads(head)
+    if not stream:
+        s.close()
+        return reply, None
+
+    def lines():
+        try:
+            for raw in f:
+                yield raw.decode("utf-8", "surrogateescape").rstrip("\n")
+        finally:
+            s.close()
+    return reply, lines()
+
+
+def journal_queue(req):
+    """AL-35: the entry waits in the journal for the service."""
+    fields = {
+        "MESSAGE": "queued for the audit log: %s %s %s" % (req["ev"], req["res"], req.get("msg", "")),
+        "PRIORITY": "5",
+        "SYSLOG_IDENTIFIER": "mp-audit-record",
+        "MP_AUDIT_PENDING": "1",
+        "MP_AUDIT_REQ": json.dumps(req, sort_keys=True),
+    }
+    data = b""
+    for k, v in fields.items():
+        v = v.encode("utf-8", "replace")
+        if b"\n" in v:
+            data += k.encode() + b"\n" + struct.pack("<Q", len(v)) + v + b"\n"
+        else:
+            data += k.encode() + b"=" + v + b"\n"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+        s.sendto(data, JOURNAL_SOCKET)
+
+
+def parent_comm():
+    try:
+        with open("/proc/%d/comm" % os.getppid()) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def cmd_record(args):
+    if args.event not in al.EVENTS:
+        print("mp-audit: unknown event %s" % args.event, file=sys.stderr)
+        return 1
+    if args.result not in al.RESULTS:
+        print("mp-audit: result must be one of %s" % ", ".join(al.RESULTS), file=sys.stderr)
+        return 1
+    data = {}
+    for kv in args.data or []:
+        if "=" not in kv:
+            print("mp-audit: --data takes KEY=VALUE", file=sys.stderr)
+            return 1
+        k, v = kv.split("=", 1)
+        data[k] = v
+    req = {"cmd": "record", "ev": args.event, "res": args.result, "actor": args.actor or "",
+           "obj": args.obj or "", "msg": args.msg or "", "data": data, "sync": args.sync,
+           "via": args.via or parent_comm()}
+    try:
+        reply, _ = request(req)
+    except Unreachable as exc:
+        req["t"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        try:
+            journal_queue(req)
+        except OSError:
+            print("mp-audit: audit service not reachable (%s), and the journal neither" % exc, file=sys.stderr)
+            return 1
+        print("mp-audit: audit service not reachable, entry queued in the journal", file=sys.stderr)
+        return 0
+    if not reply.get("ok"):
+        print("mp-audit: %s" % reply.get("error"), file=sys.stderr)
+        return 2
+    return 0
+
+
+def read_log(files):
+    """Lines from files, or from the service. Returns (lines, start)."""
+    if files:
+        def gen():
+            for path in files:
+                with open(path, "rb") as f:
+                    for raw in f:
+                        yield raw.decode("utf-8", "surrogateescape").rstrip("\n")
+        return gen(), None
+    reply, lines = request({"cmd": "read"}, stream=True)
+    if not reply.get("ok"):
+        raise Unreachable(reply.get("error", "refused"))
+    return lines, reply.get("start")
+
+
+def short(text, n):
+    text = text or ""
+    return text if len(text) <= n else text[:n - 1] + "~"
+
+
+def format_entry(e):
+    t = (e.get("t") or "").replace("T", " ")
+    if not e.get("sync", True):
+        t += "?"            # the clock was not synchronised (AL-01)
+    head = "%7s %-21s %-3s %-10s" % (e.get("seq"), t, e.get("ev"), e.get("res"))
+    who = e.get("actor") or e.get("via") or ""
+    if e.get("agg"):
+        a = e["agg"]
+        top = ", ".join("%s x%d" % (k or "-", c) for k, c in a.get("src", [])[:3])
+        body = "%d events %s .. %s; sources: %s" % (a.get("n", 0), a.get("t0"), a.get("t1"), top)
+        return "%s %s" % (head, body)
+    body = " ".join(x for x in (short(who, 20), short(e.get("obj"), 40), e.get("msg") or "") if x)
+    return "%s %s" % (head, body)
+
+
+def cmd_show(args):
+    try:
+        lines, _ = read_log(args.files)
+    except (Unreachable, OSError) as exc:
+        print("mp-audit: %s" % exc, file=sys.stderr)
+        return 1
+    want = set(args.ev or [])
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            print("        (unreadable line)")
+            continue
+        if not isinstance(e, dict):
+            continue
+        if "seal" in e or "rekey" in e:
+            if args.seals:
+                kind = "seal" if "seal" in e else "REKEY"
+                print("        %-21s %s of epoch %s" % ((e.get("t") or "").replace("T", " "), kind,
+                                                       e.get("seal", e.get("rekey"))))
+            continue
+        if want and e.get("ev") not in want:
+            continue
+        # AL-44: state, changes and summaries unless everything is asked for
+        if not (args.all or want or e.get("agg") or e.get("cls") in (al.STATE, al.CHANGE)):
+            continue
+        print(json.dumps(e, sort_keys=True) if args.json else format_entry(e))
+    return 0
+
+
+def cmd_verify(args):
+    try:
+        lines, start = read_log(args.files)
+    except (Unreachable, OSError) as exc:
+        print("mp-audit: %s" % exc, file=sys.stderr)
+        return 1
+    rep = al.verify(lines, args.start)
+    if args.json:
+        print(json.dumps(rep.as_dict(), indent=2, sort_keys=True))
+    else:
+        print("result       %s" % rep.result)
+        if rep.start:
+            print("start hash   %s" % rep.start)
+            print("fingerprint  %s" % al.fingerprint(rep.start))
+        if args.start:
+            print("anchor       %s (%s)" % (args.start, "matches" if rep.start == args.start else "DOES NOT MATCH"))
+        else:
+            print("anchor       none given: the check shows the log is intact from its start, "
+                  "not that it is the log anchored on the nameplate")
+        print("lines        %d: %d entries, %d seals, %d epochs valid" % (rep.lines, rep.entries, rep.seals,
+                                                                         rep.epochs_valid))
+        print("open epoch   %d entries not sealed yet" % rep.unsealed)
+        print("numbers      1..%d, %d counted in summaries, %d lost" % (rep.last_seq, rep.aggregated, rep.lost))
+        if rep.torn:
+            print("torn writes  %d" % rep.torn)
+        for n, epoch, text in rep.problems:
+            print("PROBLEM      line %d, epoch %d: %s" % (n, epoch, text))
+    return 0 if rep.result in ("valid", "unsealed") else 3
+
+
+def cmd_genesis(args):
+    try:
+        reply, _ = request({"cmd": "status"})
+    except Unreachable as exc:
+        print("mp-audit: %s" % exc, file=sys.stderr)
+        return 1
+    if not reply.get("start"):
+        print("mp-audit: no audit log on this computer (%s)" % (reply.get("reason") or reply.get("mode")),
+              file=sys.stderr)
+        return 1
+    print("start hash   %s" % reply["start"])
+    print("fingerprint  %s" % reply["fingerprint"])
+    return 0
+
+
+def cmd_status(args):
+    try:
+        reply, _ = request({"cmd": "status"})
+    except Unreachable as exc:
+        print("mp-audit: audit service not reachable: %s" % exc, file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(reply, indent=2, sort_keys=True))
+        return 0 if reply.get("mode") == "log" and reply.get("healthy") else 2
+    print("mode         %s%s" % (reply.get("mode"), (" - " + reply["reason"]) if reply.get("reason") else ""))
+    if reply.get("start"):
+        print("start hash   %s" % reply["start"])
+        print("fingerprint  %s" % reply["fingerprint"])
+        print("entries      up to %s, epoch %s, boot %s" % (reply["seq"], reply["epoch"], reply["boot"]))
+        print("operating    %.1f days" % (reply["op"] / 86400))
+        print("healthy      %s%s" % (reply["healthy"], (" - " + reply["fault"]) if reply.get("fault") else ""))
+        for cls in list(al.CLASSES) + ["reserve"]:
+            used = reply["used"].get(cls, 0)
+            share = reply["shares"].get(cls, 0)
+            print("  %-10s %10d of %10d bytes (%.2f %%)" % (cls, used, share, 100.0 * used / share if share else 0))
+        if reply.get("summaries"):
+            print("summaries    open for %s" % ", ".join(reply["summaries"]))
+    return 0 if reply.get("mode") == "log" and reply.get("healthy") else 2
+
+
+def cmd_reset(args):
+    actor = os.environ.get("SUDO_USER") or os.environ.get("LOGNAME") or ""
+    try:
+        reply, _ = request({"cmd": "reset", "reason": args.reason, "actor": actor})
+    except Unreachable as exc:
+        print("mp-audit: %s" % exc, file=sys.stderr)
+        return 1
+    if not reply.get("ok"):
+        print("mp-audit: %s" % reply.get("error"), file=sys.stderr)
+        return 2
+    print("new log, start hash %s" % reply["start"])
+    print("fingerprint  %s" % reply["fingerprint"])
+    print("The new start hash goes into the ERP, the operating manual and next to the nameplate (AL-58).")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="mp-audit", description="The audit log of this computer.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("record", help="record an event (root)")
+    r.add_argument("event", help="event id, E01 .. E23")
+    r.add_argument("result", help=", ".join(al.RESULTS))
+    r.add_argument("--actor")
+    r.add_argument("--obj")
+    r.add_argument("--msg")
+    r.add_argument("--via", help=argparse.SUPPRESS)
+    r.add_argument("--data", action="append", metavar="KEY=VALUE")
+    r.add_argument("--sync", action="store_true", help="return only once the entry is written and sealed")
+    s = sub.add_parser("show", help="show the log")
+    s.add_argument("--all", action="store_true", help="also attempts and operation")
+    s.add_argument("--seals", action="store_true")
+    s.add_argument("--ev", action="append", metavar="ID")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("files", nargs="*")
+    v = sub.add_parser("verify", help="check chain and seals")
+    v.add_argument("--start", metavar="HASH", help="the start hash from the nameplate")
+    v.add_argument("--json", action="store_true")
+    v.add_argument("files", nargs="*")
+    sub.add_parser("genesis", help="print the start hash")
+    st = sub.add_parser("status", help="state of the service")
+    st.add_argument("--json", action="store_true")
+    rs = sub.add_parser("reset", help="end this log and start a new one (root)")
+    rs.add_argument("--reason", required=True)
+    args = p.parse_args()
+    if getattr(args, "start", None):
+        args.start = args.start.strip().lower()
+    return {"record": cmd_record, "show": cmd_show, "verify": cmd_verify, "genesis": cmd_genesis,
+            "status": cmd_status, "reset": cmd_reset}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)
