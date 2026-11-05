@@ -740,7 +740,9 @@ def cli(env, *args):
 
 
 def test_service():
-    tmp = mkdtemp()
+    # Not on SCRATCH: the stubs below have to run, and a container mounts
+    # /dev/shm noexec. This test does not write enough for fsync to matter.
+    tmp = tempfile.mkdtemp()
     run = os.path.join(tmp, "run")
     store = os.path.join(tmp, "store")
     os.makedirs(store)
