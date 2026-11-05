@@ -17,6 +17,9 @@ What matters (docs/meltingplot-audit-log.md):
   queued in the journal (AL-35), a reset leaves a trace (AL-17) and a
   closed old log behind;
 - a summary still open is no gap for the check (AL-41);
+- a change is on the drive when record returns, attempts and operation
+  within five seconds (AL-51, decision 21); only root records, also
+  into the journal (decision 23);
 - the image and the outcome of its trial boot are recorded also in the
   boot that creates the log (E02), a stop of the service while the system
   runs is recorded (E17, T36).
@@ -40,7 +43,7 @@ sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.realpath(__file__))
 OVERLAY = os.path.join(HERE, "..", "layer", "mp-audit.d", "customize.overlay")
 LIB = os.path.realpath(os.path.join(OVERLAY, "usr", "lib", "meltingplot", "mp-audit"))
-CLI = os.path.realpath(os.path.join(OVERLAY, "usr", "sbin", "mp-audit"))
+CLI = os.path.realpath(os.path.join(OVERLAY, "usr", "bin", "mp-audit"))
 DAEMON = os.path.join(LIB, "mp-auditd")
 sys.path.insert(0, LIB)
 
@@ -234,14 +237,16 @@ def test_crash():
     d, clk, core = fresh(journal=lambda e, note=None: mirrored.append(e))
     start = core.start
     core.record("E13", "done", actor="mpadmin", msg="written")
-    core.flush()
+    # a change right before the power cut is on the drive already (decision 21)
+    sudo = core.record("E13", "done", actor="mpadmin", msg="sudo right before the power cut")
     for i in range(3):
-        core.record("E13", "done", actor="mpadmin", msg="accepted, not yet written %d" % i)
+        core.record("E12", "refused", actor="x%d" % i, msg="accepted, not yet written %d" % i)
     # power cut: nothing flushed, nothing saved
-    pending = [(e["seq"], e) for e in mirrored if e["seq"] > 2]
+    pending = [(e["seq"], e) for e in mirrored if e["ev"] == "E12"]
     clk.reboot(5)
     c2 = new_core(d, clk)
     c2.open(recover=lambda bid, first: [(s, e) for s, e in pending if s >= first])
+    check("crash: a change before the power cut kept", True, any(e["seq"] == sudo for e in entries(c2)))
     check("crash: previous boot not clean", False, c2.prev_clean)
     check("crash: numbers left by the crash", 3, c2.lost)
     check("crash: recovered from the journal", 3, len(c2.recovered))
@@ -515,6 +520,24 @@ def test_flood():
     shutil.rmtree(d)
 
 
+def test_change_at_once():
+    """Decision 21: a change is written before record returns, so a power
+    cut right after it cannot lose it. Attempts and operation wait for the
+    next flush (AL-51)."""
+    d, clk, core = fresh()
+    f0 = core.stats["fsyncs"]
+    seq = core.record("E13", "done", actor="mpadmin", msg="sudo")
+    check("change: on the drive at once", True, any(e["seq"] == seq for e in entries(core)))
+    check("change: one write for it", 1, core.stats["fsyncs"] - f0)
+    seq = core.record("E12", "refused", actor="x")
+    check("attempt: not yet on the drive", False, any(e["seq"] == seq for e in entries(core)))
+    clk.advance(ac.FLUSH_INTERVAL)
+    core.tick()
+    check("attempt: on the drive after the flush interval", True, any(e["seq"] == seq for e in entries(core)))
+    check("change: still valid", "unsealed", al.verify(lines_of(core), core.start).result)
+    shutil.rmtree(d)
+
+
 def test_wear():
     """AL-50: an hour of 100 events a second writes a bounded amount, in a
     bounded number of writes."""
@@ -703,9 +726,8 @@ def test_service():
           e18.get("msg"))
     check("service: machine from the identity", "chx-350-001", e18.get("mach"))
     check("service: the first start records the image (E02)", "E02", evs[2] if len(evs) > 2 else None)
-    if os.geteuid() != 0:
-        rc, _, err = cli(env, "record", "E10", "refused", "--actor", "1-1")
-        check("service: only root records", 2, rc)
+    rc, _, err = cli(dict(env, MP_AUDIT_UID="1000"), "record", "E10", "refused", "--actor", "1-1")
+    check("service: only root records", (2, "mp-audit: only root records"), (rc, err.strip()))
     rc, out, _ = cli(env, "verify", "--start", st.get("start", ""))
     check("service: verify on the device", 0, rc)
     p.send_signal(signal.SIGTERM)
@@ -750,7 +772,8 @@ def test_service():
             journal.recv(65536)
         except socket.timeout:
             break
-    rc, _, err = cli(dict(env, MP_AUDIT_SOCKET=os.path.join(tmp, "nowhere")), "record", "E10", "refused",
+    nowhere = dict(env, MP_AUDIT_SOCKET=os.path.join(tmp, "nowhere"))
+    rc, _, err = cli(dict(nowhere, MP_AUDIT_UID="0"), "record", "E10", "refused",
                      "--actor", "1-1", "--obj", "046a:0011")
     got = b""
     try:
@@ -758,14 +781,24 @@ def test_service():
     except socket.timeout:
         pass
     check("record: without the service it queues in the journal", (0, True), (rc, b"MP_AUDIT_PENDING=1" in got))
+    # Decision 23: without root nothing goes into the journal; the service
+    # would not take it over anyway
+    rc, _, err = cli(dict(nowhere, MP_AUDIT_UID="1000"), "record", "E10", "refused", "--actor", "1-1")
+    got = b""
+    try:
+        got = journal.recv(65536)
+    except socket.timeout:
+        pass
+    check("record: without root it refuses and queues nothing", (2, False), (rc, b"MP_AUDIT_PENDING=1" in got),
+          err.strip())
     journal.close()
     shutil.rmtree(tmp)
 
 
 def main():
     for t in (test_chain, test_tamper, test_restart, test_crash, test_lost_key, test_strings,
-              test_parallel, test_reset, test_open_summary, test_budget_design, test_flood, test_wear,
-              test_clock, test_trial, test_service):
+              test_parallel, test_reset, test_open_summary, test_budget_design, test_flood, test_change_at_once,
+              test_wear, test_clock, test_trial, test_service):
         t()
     sys.exit(failed)
 

@@ -51,7 +51,7 @@ SHARES = {
 # rest arrives with the operating time, so that the share lasts five years.
 BURST_DIVISOR = 64
 
-FLUSH_INTERVAL = 5          # AL-51: other than state, written every 5 s
+FLUSH_INTERVAL = 5          # AL-51: attempts and operation, written every 5 s
 SAVE_INTERVAL = 60          # AL-51: counters at most once a minute
 OPTIME_INTERVAL = 600       # AL-51: operating time at most every 10 minutes
 EPOCH = 900                 # AL-55: 15 minutes of operating time
@@ -663,10 +663,13 @@ class AuditCore:
                sync=False, force=False):
         """Accept one event. Returns its sequence number.
 
-        Written at the next flush, within five seconds (AL-51); with sync,
-        or for the class state, written and sealed before this returns
-        (AL-56). Over the budget of its class it is counted in a summary
-        instead (AL-41)."""
+        Attempts and operation are written at the next flush, within five
+        seconds (AL-51). Changes are written before this returns, so a power
+        cut cannot take an intervention that was already let through
+        (decision 21); they are sealed with their epoch. With sync, or for
+        the class state, written and sealed before this returns (AL-56).
+        Over the budget of its class it is counted in a summary instead
+        (AL-41)."""
         if ev not in al.EVENTS:
             raise ValueError("unknown event %r" % ev)
         if res not in al.RESULTS:
@@ -701,6 +704,11 @@ class AuditCore:
             elif sync:
                 self.flush()
                 self._seal_if_affordable(cls)
+            elif cls == al.CHANGE:
+                # Decision 21: on the drive at once. The journal syncs only
+                # every few minutes, so after a power cut neither would know
+                # of it, and its number would be handed out again.
+                self.flush()
             return e["seq"]
 
     def _open_summary(self, key, cls, ev, e, op):

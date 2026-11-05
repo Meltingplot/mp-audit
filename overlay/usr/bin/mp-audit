@@ -8,14 +8,16 @@
   mp-audit status [--json]
   mp-audit reset --reason TEXT
 
-Requirements: docs/meltingplot-audit-log.md. Recording takes root (AL-10);
-showing and checking take root or the group adm, which the Connect account
-is in (AL-20). Given files, show and verify read those instead of asking the
+Requirements: docs/meltingplot-audit-log.md. Recording takes root (AL-10):
+without it, record stops at once with exit 2 and queues nothing (decision
+23). Showing and checking take root or the group adm, which the Connect
+account is in (AL-20); that is why this tool is in /usr/bin (decision 22). Given files, show and verify read those instead of asking the
 service, for instance an exported log on another computer, where this script
 and auditlog.py next to it are all it takes besides python3-cryptography.
 
-When the service is not running, record puts the entry into the journal,
-marked as queued, and the service takes it over when it starts (AL-35).
+When the service is not running, record as root puts the entry into the
+journal, marked as queued, and the service takes it over when it starts
+(AL-35). It takes over only what root queued.
 
 Exit status: 0 done; 1 usage or the service is not reachable; 2 refused by
 the service; 3 the check did not find the log valid (a check of files that
@@ -40,6 +42,10 @@ import auditlog as al   # noqa: E402
 
 SOCK = os.environ.get("MP_AUDIT_SOCKET", "/run/mp-audit/socket")
 JOURNAL_SOCKET = os.environ.get("MP_AUDIT_JOURNAL", "/run/systemd/journal/socket")
+# The user id this tool assumes, for the tests on the build host. It opens
+# nothing: the service checks the real one on its socket and takes over only
+# entries that root queued in the journal.
+UID = int(os.environ.get("MP_AUDIT_UID", os.geteuid()))
 
 
 class Unreachable(Exception):
@@ -105,6 +111,9 @@ def parent_comm():
 
 
 def cmd_record(args):
+    if UID != 0:
+        print("mp-audit: only root records", file=sys.stderr)
+        return 2
     if args.event not in al.EVENTS:
         print("mp-audit: unknown event %s" % args.event, file=sys.stderr)
         return 1
