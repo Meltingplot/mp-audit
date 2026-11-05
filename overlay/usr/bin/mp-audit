@@ -95,11 +95,11 @@ def journal_queue(req):
     }
     data = b""
     for k, v in fields.items():
-        v = v.encode("utf-8", "replace")
-        if b"\n" in v:
-            data += k.encode() + b"\n" + struct.pack("<Q", len(v)) + v + b"\n"
+        raw = v.encode("utf-8", "replace")
+        if b"\n" in raw:
+            data += k.encode() + b"\n" + struct.pack("<Q", len(raw)) + raw + b"\n"
         else:
-            data += k.encode() + b"=" + v + b"\n"
+            data += k.encode() + b"=" + raw + b"\n"
     with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
         s.sendto(data, JOURNAL_SOCKET)
 

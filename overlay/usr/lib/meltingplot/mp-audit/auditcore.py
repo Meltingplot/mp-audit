@@ -23,6 +23,7 @@ it that concerns the log is recomputed from the lines written after the
 position it names, and the whole log is read when it is missing.
 """
 
+import ctypes
 import hashlib
 import json
 import os
@@ -91,8 +92,6 @@ def clock_synced():
     clients (timesyncd on the printer SBC, chrony on the panel) report it:
     adjtimex answers TIME_ERROR (5) while it is not."""
     try:
-        import ctypes
-
         libc = ctypes.CDLL(None, use_errno=True)
         buf = ctypes.create_string_buffer(512)  # struct timex, modes = 0
         return libc.adjtimex(buf) not in (-1, 5)

@@ -118,6 +118,11 @@ def unb64(text):
 
 # --- strings from outside (AL-02) ---------------------------------------------
 
+# Control characters: C0, DEL and C1.
+C0_END = 0x20
+DEL = 0x7F
+C1_START, C1_END = 0x80, 0xA0
+
 
 def clean(value, limit):
     """Bounded and free of control characters. Never interpreted."""
@@ -125,7 +130,7 @@ def clean(value, limit):
     out = []
     for ch in text[:limit]:
         o = ord(ch)
-        if o < 0x20 or o == 0x7F or 0x80 <= o < 0xA0:
+        if o < C0_END or o == DEL or C1_START <= o < C1_END:
             out.append(f"\\x{o:02x}")
         else:
             out.append(ch)
@@ -143,9 +148,7 @@ def clean_data(data, keys=16, limit=256):
     for k in sorted(data)[:keys]:
         key = clean(k, 24)
         v = data[k]
-        if isinstance(v, bool) or v is None:
-            out[key] = v
-        elif isinstance(v, int) and abs(v) < 2**63:
+        if isinstance(v, bool) or v is None or (isinstance(v, int) and abs(v) < 2**63):
             out[key] = v
         else:
             out[key] = clean(v, limit)
