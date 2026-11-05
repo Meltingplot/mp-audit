@@ -36,12 +36,12 @@ import tempfile
 import threading
 import time
 
-# The modules are imported from the layer's overlay, which goes into the
-# image as it is: no __pycache__ may be left there.
+# The modules are imported from the overlay, which goes into the image as it
+# is: no __pycache__ may be left there.
 sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.realpath(__file__))
-OVERLAY = os.path.join(HERE, "..", "layer", "mp-audit.d", "customize.overlay")
+OVERLAY = os.path.join(HERE, "..", "overlay")
 LIB = os.path.realpath(os.path.join(OVERLAY, "usr", "lib", "meltingplot", "mp-audit"))
 CLI = os.path.realpath(os.path.join(OVERLAY, "usr", "bin", "mp-audit"))
 DAEMON = os.path.join(LIB, "mp-auditd")
