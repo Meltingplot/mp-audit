@@ -62,9 +62,9 @@ def mkdtemp():
 def check(name, want, got, detail=None):
     global failed
     if want == got:
-        print("ok   %-60s %s" % (name, got if detail is None else detail))
+        print(f"ok   {name!s:<60} {got if detail is None else detail}")
     else:
-        print("FAIL %-60s expected=%r got=%r %s" % (name, want, got, "" if detail is None else detail))
+        print(f"FAIL {name!s:<60} expected={want!r} got={got!r} {'' if detail is None else detail}")
         failed = 1
 
 
@@ -95,7 +95,7 @@ class Clock:
         self.m += s
 
     def reboot(self, n):
-        self.bid = "b" * 30 + "%02d" % n
+        self.bid = "b" * 30 + f"{n:02d}"
         self.bt = 1.0
 
 
@@ -137,7 +137,7 @@ def test_chain():
     d, clk, core = fresh()
     start = core.start
     for i in range(5):
-        core.record("E10", "refused", actor="1-%d" % i, obj="046a:0011", msg="keyboard")
+        core.record("E10", "refused", actor=f"1-{i}", obj="046a:0011", msg="keyboard")
     clk.advance(6)
     core.tick()
     core.record("E13", "done", actor="mpadmin", msg="systemctl status")
@@ -147,7 +147,7 @@ def test_chain():
     check("chain: every number accounted", [], rep.problems)
     check("chain: other start hash is foreign", "foreign", al.verify(lines_of(core), "0" * 64).result)
     keys = os.listdir(os.path.join(d, "own", "keys"))
-    check("keys: only the open epoch's key on disk", ["epoch-%d.key" % core.epoch], keys)
+    check("keys: only the open epoch's key on disk", [f"epoch-{core.epoch}.key"], keys)
     last_seal = [json.loads(x) for x in lines_of(core) if '"seal"' in x][-1]
     with open(os.path.join(d, "own", "keys", keys[0]), "rb") as f:
         check(
@@ -174,7 +174,7 @@ def test_tamper():
     objs[i]["msg"] = "nothing happened"
     # the chain recomputed from there on, and every seal re-signed with the
     # only key there is on disk, that of the open epoch
-    keyfile = os.path.join(d, "own", "keys", "epoch-%d.key" % core.epoch)
+    keyfile = os.path.join(d, "own", "keys", f"epoch-{core.epoch}.key")
     with open(keyfile, "rb") as f:
         cur = al.key_from_bytes(f.read())
     prev = al.ZERO
@@ -243,7 +243,7 @@ def test_crash():
     # a change right before the power cut is on the drive already (decision 21)
     sudo = core.record("E13", "done", actor="mpadmin", msg="sudo right before the power cut")
     for i in range(3):
-        core.record("E12", "refused", actor="x%d" % i, msg="accepted, not yet written %d" % i)
+        core.record("E12", "refused", actor=f"x{i}", msg=f"accepted, not yet written {i}")
     # power cut: nothing flushed, nothing saved
     pending = [(e["seq"], e) for e in mirrored if e["ev"] == "E12"]
     clk.reboot(5)
@@ -330,7 +330,7 @@ def test_parallel():
 
     def writer(n):
         for i in range(200):
-            core.record("E13", "done", actor="t%d" % n, msg=str(i))
+            core.record("E13", "done", actor=f"t{n}", msg=str(i))
 
     ts = [threading.Thread(target=writer, args=(n,)) for n in range(8)]
     for t in ts:
@@ -341,7 +341,7 @@ def test_parallel():
     rep = al.verify(lines_of(core), start)
     check("parallel: valid", "valid", rep.result)
     seqs = [e["seq"] for e in entries(core)]
-    check("parallel: numbers unique and in order", True, seqs == sorted(set(seqs)), "%d entries" % len(seqs))
+    check("parallel: numbers unique and in order", True, seqs == sorted(set(seqs)), f"{len(seqs)} entries")
     shutil.rmtree(d)
 
 
@@ -351,9 +351,9 @@ def flood_until_summary(core, ev="E12", res="refused"):
     n = 0
     while not core.summaries:
         n += 1
-        core.record(ev, res, actor="user%d" % n, obj="10.0.0.%d" % (n % 250))
+        core.record(ev, res, actor=f"user{n}", obj=f"10.0.0.{n % 250}")
     for i in range(100):
-        core.record(ev, res, actor="user%d" % (n + i), obj="10.0.1.%d" % i)
+        core.record(ev, res, actor=f"user{n + i}", obj=f"10.0.1.{i}")
     return n + 100
 
 
@@ -469,7 +469,7 @@ def summary_max():
             }
         )
     d, clk, core = fresh()
-    e = core._entry("E10", al.AGGREGATED, msg="%d events counted" % (10**9))
+    e = core._entry("E10", al.AGGREGATED, msg=f"{10**9} events counted")
     e["cls"] = al.ATTEMPT
     e["agg"] = s.agg()
     size = core._cost(e)
@@ -496,10 +496,10 @@ def test_budget_design():
         b = ac.Bucket(ac.SHARES[cls])
         daily = b.rate * ac.DAY
         check(
-            "budget: %-9s earns a day's summaries (%d ids)" % (cls, len(ids)),
+            f"budget: {cls!s:<9} earns a day's summaries ({len(ids)} ids)",
             True,
             daily >= len(ids) * smax,
-            "earns %d B a day, needs %d" % (daily, len(ids) * smax),
+            f"earns {daily:.0f} B a day, needs {len(ids) * smax}",
         )
 
 
@@ -521,11 +521,9 @@ def test_flood():
     step = 20
     for i in range(days * 86400 // step):
         n += 1
-        core.record(
-            "E10", "refused", actor="1-%d" % (n % 7), obj="%04x:%04x" % (n % 65536, n % 9973), msg="device %d" % n
-        )
-        core.record("E12", "refused", actor="user%d" % n, obj="10.0.%d.%d" % (n % 250, n % 13))
-        core.record("E11", "info", obj="stick%d" % n)
+        core.record("E10", "refused", actor=f"1-{n % 7}", obj=f"{n % 65536:04x}:{n % 9973:04x}", msg=f"device {n}")
+        core.record("E12", "refused", actor=f"user{n}", obj=f"10.0.{n % 250}.{n % 13}")
+        core.record("E11", "info", obj=f"stick{n}")
         clk.advance(step)
         core.tick()
         if i == days * 86400 // step // 2:
@@ -549,10 +547,10 @@ def test_flood():
         b = ac.Bucket(ac.SHARES[cls])
         allowance = b.cap + b.rate * op + 2 * summary_max()
         check(
-            "flood: %-9s within its budget" % cls,
+            f"flood: {cls!s:<9} within its budget",
             True,
             core.used[cls] <= allowance,
-            "used %d B, allowed %d" % (core.used[cls], allowance),
+            f"used {core.used[cls]} B, allowed {allowance:.0f}",
         )
     first = {}
     for e in es:
@@ -588,18 +586,18 @@ def test_wear():
     b0, f0 = core.stats["bytes"], core.stats["fsyncs"]
     for s in range(3600):
         for i in range(100):
-            core.record("E10", "refused", actor="1-%d" % i, obj="%d" % s)
+            core.record("E10", "refused", actor=f"1-{i}", obj=f"{s}")
         clk.advance(1)
         core.tick()
     written = core.stats["bytes"] - b0
     syncs = core.stats["fsyncs"] - f0
     cap = ac.Bucket(ac.SHARES[al.ATTEMPT]).cap
-    check("wear: bytes within the burst of the class", True, written <= cap + 64 * 1024, "%d B" % written)
+    check("wear: bytes within the burst of the class", True, written <= cap + 64 * 1024, f"{written} B")
     check(
         "wear: at most one flush per 5 s, state once a minute",
         True,
         syncs <= 3600 // 5 + 3 * 60 + 20,
-        "%d fsyncs" % syncs,
+        f"{syncs} fsyncs",
     )
     shutil.rmtree(d)
 
@@ -761,7 +759,7 @@ def test_service():
         f.write("running\n")
     systemctl = os.path.join(tmp, "systemctl")
     with open(systemctl, "w") as f:
-        f.write("#!/bin/sh\ncat '%s'\n" % sysstate)
+        f.write(f"#!/bin/sh\ncat '{sysstate}'\n")
     os.chmod(systemctl, 0o755)
     jsock = os.path.join(tmp, "journal.sock")
     journal = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)

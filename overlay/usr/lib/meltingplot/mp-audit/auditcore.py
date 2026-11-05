@@ -273,7 +273,7 @@ class AuditCore:
     # --- files -----------------------------------------------------------------
 
     def _segpath(self, n):
-        return os.path.join(self.logdir, "%08d.jsonl" % n)
+        return os.path.join(self.logdir, f"{n:08d}.jsonl")
 
     def segments(self):
         try:
@@ -296,7 +296,7 @@ class AuditCore:
         try:
             subprocess.run(["chattr", flag, path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except (OSError, subprocess.CalledProcessError):
-            self.notes.append(("chattr", "cannot set %s on %s" % (flag, path)))
+            self.notes.append(("chattr", f"cannot set {flag} on {path}"))
 
     def _append(self, data):
         path = self._segpath(self.seg)
@@ -374,7 +374,7 @@ class AuditCore:
     # --- keys ------------------------------------------------------------------
 
     def _keypath(self, n):
-        return os.path.join(self.keydir, "epoch-%d.key" % n)
+        return os.path.join(self.keydir, f"epoch-{n}.key")
 
     def _store_key(self, n, key):
         path = self._keypath(n)
@@ -443,7 +443,7 @@ class AuditCore:
         self.key = key
         self.epoch_op = self.op()
         self._wipe_keys_except(self._keypath(self.epoch))
-        self.notes.append(("rekey", "key of epoch %d lost; it cannot be sealed" % old))
+        self.notes.append(("rekey", f"key of epoch {old} lost; it cannot be sealed"))
 
     # --- state -----------------------------------------------------------------
 
@@ -522,7 +522,7 @@ class AuditCore:
             segs = self.segments()
             if not segs or all(os.path.getsize(self._segpath(s)) == 0 for s in segs):
                 if st and st.get("start"):
-                    self.notes.append(("missing", "the log of start hash %s is gone" % st["start"]))
+                    self.notes.append(("missing", f"the log of start hash {st['start']} is gone"))
                 self._boots(st)
                 self.extra = (st or {}).get("extra", {})
                 self.seg = 1
@@ -710,9 +710,9 @@ class AuditCore:
         Over the budget of its class it is counted in a summary instead
         (AL-41)."""
         if ev not in al.EVENTS:
-            raise ValueError("unknown event %r" % ev)
+            raise ValueError(f"unknown event {ev!r}")
         if res not in al.RESULTS:
-            raise ValueError("unknown result %r" % res)
+            raise ValueError(f"unknown result {res!r}")
         with self.lock:
             e = self._entry(ev, res, actor, via, obj, msg, data)
             cls = e["cls"]
@@ -764,7 +764,7 @@ class AuditCore:
                 "E19",
                 "info",
                 obj=key,
-                msg="%s over the budget of class %s, counted in a summary" % (ev, cls),
+                msg=f"{ev} over the budget of class {cls}, counted in a summary",
                 data={"class": cls, "event": ev, "from": e["seq"]},
             )
 
@@ -775,7 +775,7 @@ class AuditCore:
             s = self.summaries[key]
             if not force and not s.due(op):
                 continue
-            e = self._entry(s.ev, al.AGGREGATED, msg="%d events counted" % s.n)
+            e = self._entry(s.ev, al.AGGREGATED, msg=f"{s.n} events counted")
             e["cls"] = s.cls
             e["agg"] = s.agg()
             cost = self._cost(e)
@@ -803,7 +803,7 @@ class AuditCore:
         lost = self.pending[PENDING_MAX // 2 :]
         del self.pending[PENDING_MAX // 2 :]
         e = self._entry(
-            "E17", "failed", msg="audit log not writable, %d entries lost" % len(lost), data={"lost": len(lost)}
+            "E17", "failed", msg=f"audit log not writable, {len(lost)} entries lost", data={"lost": len(lost)}
         )
         self.pending.append(e)
         self.journal(e)
@@ -973,7 +973,7 @@ class AuditCore:
             stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
             archive = os.path.join(self.root, "archive")
             os.makedirs(archive, exist_ok=True)
-            os.rename(self.own, os.path.join(archive, "%s-%s" % (stamp, (self.start or "none")[:16])))
+            os.rename(self.own, os.path.join(archive, f"{stamp}-{(self.start or 'none')[:16]}"))
             self._fsync_dir(archive)
             self._fsync_dir(self.root)
             self._reset_memory()

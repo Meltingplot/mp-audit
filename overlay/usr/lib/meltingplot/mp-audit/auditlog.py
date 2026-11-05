@@ -126,7 +126,7 @@ def clean(value, limit):
     for ch in text[:limit]:
         o = ord(ch)
         if o < 0x20 or o == 0x7F or 0x80 <= o < 0xA0:
-            out.append("\\x%02x" % o)
+            out.append(f"\\x{o:02x}")
         else:
             out.append(ch)
     text = "".join(out)[:limit]
@@ -353,7 +353,7 @@ def verify(lines, start=None, open_summaries=None):
         if "seal" in obj:
             rep.seals += 1
             if obj.get("seal") != epoch:
-                rep.problems.append((n, epoch, "seal of epoch %s where %d was due" % (obj.get("seal"), epoch)))
+                rep.problems.append((n, epoch, f"seal of epoch {obj.get('seal')} where {epoch} was due"))
                 epoch_ok = False
             if pub is None or not signature_valid(pub, obj.get("sig", ""), seal_payload(obj)):
                 rep.problems.append((n, epoch, "seal not signed by the key of its epoch"))
@@ -369,7 +369,7 @@ def verify(lines, start=None, open_summaries=None):
             # a new one nobody vouched for. Valid in form, but whatever the
             # epoch held can no longer be shown to be unaltered.
             rep.rekeys += 1
-            rep.problems.append((n, epoch, "new key without a seal: epoch %d is not verifiable" % epoch))
+            rep.problems.append((n, epoch, f"new key without a seal: epoch {epoch} is not verifiable"))
             pub = obj.get("next")
             epoch += 1
             epoch_ok = True
@@ -377,7 +377,7 @@ def verify(lines, start=None, open_summaries=None):
         else:
             seq = obj.get("seq")
             if not isinstance(seq, int) or seq <= rep.last_seq:
-                rep.problems.append((n, epoch, "sequence number %r out of order" % (seq,)))
+                rep.problems.append((n, epoch, f"sequence number {seq!r} out of order"))
                 epoch_ok = False
             else:
                 if seq > rep.last_seq + 1:
@@ -395,13 +395,13 @@ def verify(lines, start=None, open_summaries=None):
                 rep.accounted += data["lost"]
                 rep.lost += data["lost"]
             if obj.get("ev") == "E19" and isinstance(data, dict):
-                key = "%s/%s" % (data.get("class"), data.get("event"))
+                key = f"{data.get('class')}/{data.get('event')}"
                 first = data.get("from")
                 announced[first if isinstance(first, int) else key] = key
             if isinstance(agg, dict):
                 # closed: by its first number, or, in logs from before
                 # E19 named it, by class and id
-                key = "%s/%s" % (obj.get("cls"), obj.get("ev"))
+                key = f"{obj.get('cls')}/{obj.get('ev')}"
                 first = agg.get("from")
                 if isinstance(first, int) and first in announced:
                     del announced[first]
@@ -425,7 +425,7 @@ def verify(lines, start=None, open_summaries=None):
                 (
                     rep.lines,
                     epoch,
-                    "%d events counted and %d in open summaries, %d numbered" % (rep.accounted, held, top),
+                    f"{rep.accounted} events counted and {held} in open summaries, {top} numbered",
                 )
             )
         else:
@@ -447,8 +447,8 @@ def verify(lines, start=None, open_summaries=None):
                     (
                         rep.lines,
                         epoch,
-                        "%d numbers missing before the first open summary (%d), "
-                        "%d in summaries written or declared lost" % (before, first, explained),
+                        f"{before} numbers missing before the first open summary ({first}), "
+                        f"{explained} in summaries written or declared lost",
                     )
                 )
         if not rep.problems:
@@ -456,5 +456,5 @@ def verify(lines, start=None, open_summaries=None):
             rep.pending_keys = sorted(set(announced.values()))
             rep.confirmed = False
     elif short != 0:
-        rep.problems.append((rep.lines, epoch, "%d events counted, %d numbered" % (rep.accounted, rep.last_seq)))
+        rep.problems.append((rep.lines, epoch, f"{rep.accounted} events counted, {rep.last_seq} numbered"))
     return rep

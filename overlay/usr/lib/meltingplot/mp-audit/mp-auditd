@@ -87,13 +87,13 @@ def journal_send(message, priority=6, **fields):
 
 
 def describe(e):
-    text = "%s %s" % (e.get("ev"), e.get("res"))
+    text = f"{e.get('ev')} {e.get('res')}"
     if e.get("msg"):
         text += ": " + e["msg"]
     if e.get("obj"):
-        text += " [%s]" % e["obj"]
+        text += f" [{e['obj']}]"
     if e.get("actor"):
-        text += " (%s)" % e["actor"]
+        text += f" ({e['actor']})"
     return text
 
 
@@ -171,7 +171,7 @@ class Computer:
         return {
             "sys": self.device.get("MP_ROLE", "sbc"),
             "host": socket.gethostname(),
-            "mach": "%s-%s" % (product, serial) if serial else "unprovisioned",
+            "mach": f"{product}-{serial}" if serial else "unprovisioned",
             "img": self.device.get("MP_VERSION", "") or "unknown",
         }
 
@@ -183,7 +183,7 @@ class Computer:
             st = os.stat("/")
         except OSError:
             return "unknown"
-        base = "/sys/dev/block/%d:%d" % (os.major(st.st_dev), os.minor(st.st_dev))
+        base = f"/sys/dev/block/{os.major(st.st_dev)}:{os.minor(st.st_dev)}"
         devices = [base]
         slaves = os.path.join(base, "slaves")
         if os.path.isdir(slaves):
@@ -207,7 +207,7 @@ class Computer:
 
     @staticmethod
     def committed():
-        rc, _, _ = run(["sh", "-c", ". %s && mp_slot_committed" % COMMON], 30)
+        rc, _, _ = run(["sh", "-c", f". {COMMON} && mp_slot_committed"], 30)
         return rc == 0
 
     def identity_data(self, dev):
@@ -221,9 +221,9 @@ class Computer:
         if dev:
             rc, pk, _ = run(["lsblk", "-ndo", "PKNAME", dev], 10)
             if rc == 0 and pk:
-                model = read_text("/sys/block/%s/device/model" % pk).strip()
-                serial = read_text("/sys/block/%s/device/serial" % pk).strip()
-                data["drive"] = ("%s %s" % (model, serial)).strip()
+                model = read_text(f"/sys/block/{pk}/device/model").strip()
+                serial = read_text(f"/sys/block/{pk}/device/serial").strip()
+                data["drive"] = (f"{model} {serial}").strip()
         return data
 
 
@@ -235,7 +235,7 @@ def mounted_elsewhere(dev):
     Only root can do that, and it is worth an entry."""
     try:
         st = os.stat(dev)
-        mm = "%d:%d" % (os.major(st.st_rdev), os.minor(st.st_rdev))
+        mm = f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
         with open("/proc/1/mountinfo") as f:
             return any(line.split()[2] == mm for line in f)
     except (OSError, IndexError):
@@ -274,7 +274,7 @@ def mount_store(notes):
             return None, dev
         notes.append(("E17", "info", "empty audit partition formatted", {}))
     elif rc != 0 or fstype != "ext4":
-        notes.append(("E17", "failed", "audit partition holds %r, not ext4; left as it is" % fstype, {}))
+        notes.append(("E17", "failed", f"audit partition holds {fstype!r}, not ext4; left as it is", {}))
         return None, dev
     if mounted_elsewhere(dev):
         notes.append(("E17", "failed", "audit partition is mounted outside the audit service", {}))
@@ -283,17 +283,15 @@ def mount_store(notes):
         if rc >= 4:
             # Damaged: it may be the proof, so it is never repaired by force
             # or formatted (AL-37).
-            notes.append(
-                ("E17", "failed", "audit partition damaged (e2fsck %d), left as it is: %s" % (rc, err[:120]), {})
-            )
+            notes.append(("E17", "failed", f"audit partition damaged (e2fsck {rc}), left as it is: {err[:120]}", {}))
             return None, dev
         if rc:
-            notes.append(("E17", "info", "e2fsck repaired the audit partition (%d)" % rc, {}))
+            notes.append(("E17", "info", f"e2fsck repaired the audit partition ({rc})", {}))
     os.makedirs(STORE, mode=0o700, exist_ok=True)
     try:
         sys_mount(dev, STORE)
     except OSError as exc:
-        notes.append(("E17", "failed", "cannot mount the audit partition: %s" % exc, {}))
+        notes.append(("E17", "failed", f"cannot mount the audit partition: {exc}", {}))
         return None, dev
     return STORE, dev
 
@@ -424,7 +422,7 @@ class Service:
         except Exception as exc:  # noqa: BLE001 - never a restart loop over the proof
             self.core = None
             self.mode = "journal-only"
-            self.reason = "audit log cannot be opened: %s" % exc
+            self.reason = f"audit log cannot be opened: {exc}"
             self.record("E17", "failed", self.reason)
             for ev, res, msg, data in notes:
                 self.record(ev, res, msg, data=data)
@@ -443,7 +441,7 @@ class Service:
                     }
                 )
             start = self.core.genesis(data=data)
-            log("audit log created, start hash %s" % start)
+            log(f"audit log created, start hash {start}")
         for kind, text in self.core.notes:
             self.record("E17", "failed" if kind in ("write", "rekey", "missing") else "info", text, data={"kind": kind})
         for ev, res, msg, data in notes:
@@ -480,13 +478,13 @@ class Service:
         elif kept:
             msg, res = "reinstallation, the kept audit partition held no readable log", "failed"
         elif before in ("gen1", "gen2"):
-            msg, res = "installation over layout %s, no earlier audit log" % before, "done"
+            msg, res = f"installation over layout {before}, no earlier audit log", "done"
         elif before == "gen3":
             msg, res = "installation over layout gen3 without keeping its audit log", "done"
         elif before == "blank":
             msg, res = "installation on an empty drive", "done"
         else:
-            msg, res = "installation over a drive with layout %r" % (before or "unknown"), "done"
+            msg, res = f"installation over a drive with layout {before or 'unknown'!r}", "done"
         data = {
             k: info.get(k, "")
             for k in ("image", "sha256", "installer", "installed", "layout_before", "keep_part", "kept", "drive")
@@ -506,7 +504,7 @@ class Service:
             self.record(
                 "E17",
                 "info",
-                "the audit service started again within this boot, %s s after its stop" % data.get("gap", "?"),
+                f"the audit service started again within this boot, {data.get('gap', '?')} s after its stop",
                 data=data,
             )
         if not core.prev_clean and core.prev_bid:
@@ -516,7 +514,7 @@ class Service:
                     "E15",
                     "info",
                     "the previous boot ended without a clean stop of the audit log",
-                    data={"boot": core.boot - 1, "rsts": "%08x" % rsts if rsts is not None else ""},
+                    data={"boot": core.boot - 1, "rsts": f"{rsts:08x}" if rsts is not None else ""},
                 )
             else:
                 self.record("E17", "failed", "the audit service was restarted without a clean stop")
@@ -525,8 +523,8 @@ class Service:
             self.record(
                 "E17",
                 "failed",
-                "%d entries accepted before the crash did not reach the audit partition; "
-                "%d recovered from the journal" % (core.lost, len(seen)),
+                f"{core.lost} entries accepted before the crash did not reach the audit partition; "
+                f"{len(seen)} recovered from the journal",
                 data={"lost": core.lost, "recovered": len(seen)},
                 force=True,
             )
@@ -566,7 +564,7 @@ class Service:
                     self.record(
                         "E02",
                         "done",
-                        "image %s committed after its trial boot" % trial.get("to", ""),
+                        f"image {trial.get('to', '')} committed after its trial boot",
                         obj=trial.get("to", ""),
                         data=trial,
                     )
@@ -575,8 +573,8 @@ class Service:
                 self.record(
                     "E02",
                     "failed",
-                    "trial boot of %s in %s was not committed, now %s in %s"
-                    % (trial.get("to"), trial.get("slot"), cur.get("version"), cur.get("slot")),
+                    f"trial boot of {trial.get('to')} in {trial.get('slot')} was not committed, "
+                    f"now {cur.get('version')} in {cur.get('slot')}",
                     obj=trial.get("to", ""),
                     data=trial,
                 )
@@ -592,7 +590,7 @@ class Service:
             self.record(
                 "E02",
                 "done",
-                "image %s started in %s" % (cur.get("version"), cur.get("slot")),
+                f"image {cur.get('version')} started in {cur.get('slot')}",
                 obj=cur.get("name", ""),
                 data=data,
             )
@@ -612,7 +610,7 @@ class Service:
             self.record(
                 "E02",
                 "done",
-                "image %s committed after its trial boot" % trial.get("to", ""),
+                f"image {trial.get('to', '')} committed after its trial boot",
                 obj=trial.get("to", ""),
                 data=trial,
             )
@@ -632,11 +630,11 @@ class Service:
                 data["from"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.last_off + boot))
                 data["delta"] = int(off - self.last_off)
             if first_sync and jump:
-                msg = "system clock synchronised, moved by %d s" % data["delta"]
+                msg = f"system clock synchronised, moved by {data['delta']} s"
             elif first_sync:
                 msg = "system clock synchronised"
             else:
-                msg = "system clock set, moved by %d s" % data["delta"]
+                msg = f"system clock set, moved by {data['delta']} s"
             self.record("E16", "done" if jump else "info", msg, data=data)
         if synced and not self.synced_once:
             self.synced_once = True
@@ -693,7 +691,7 @@ class Service:
                 self.core.tick()
                 if len(self.core.notes) > noted:
                     for kind, text in self.core.notes[noted:]:
-                        journal_send("audit log fault (%s): %s" % (kind, text), 3)
+                        journal_send(f"audit log fault ({kind}): {text}", 3)
                     noted = len(self.core.notes)
                 self.watch_trial()
             self.watch_clock()
@@ -736,7 +734,7 @@ class Handler(socketserver.StreamRequestHandler):
             if not isinstance(req, dict):
                 raise ValueError("not an object")
         except (OSError, ValueError) as exc:
-            self.reply({"ok": False, "error": "bad request: %s" % exc})
+            self.reply({"ok": False, "error": f"bad request: {exc}"})
             return
         cmd = req.get("cmd")
         try:
@@ -747,7 +745,7 @@ class Handler(socketserver.StreamRequestHandler):
                 if req.get("ev") not in al.EVENTS or req.get("res") not in al.RESULTS:
                     self.reply({"ok": False, "error": "unknown event or result"})
                     return
-                via = req.get("via") or read_text("/proc/%d/comm" % pid)
+                via = req.get("via") or read_text(f"/proc/{pid}/comm")
                 seq = svc.record(
                     req.get("ev"),
                     req.get("res"),
@@ -785,7 +783,7 @@ class Handler(socketserver.StreamRequestHandler):
                 start = svc.core.reset(reason, req.get("actor", "") or "uid 0", data=svc.pc.identity_data(None))
                 self.reply({"ok": True, "start": start, "fingerprint": al.fingerprint(start)})
             else:
-                self.reply({"ok": False, "error": "unknown command %r" % cmd})
+                self.reply({"ok": False, "error": f"unknown command {cmd!r}"})
         except ValueError as exc:
             self.reply({"ok": False, "error": str(exc)})
         except OSError:

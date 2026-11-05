@@ -35,7 +35,6 @@ select = [
     "RUF100", # noqa comments that do nothing
 ]
 ignore = [
-    "UP031", # % formatting is the house style; rewriting it in the code that writes the proof gains nothing
     "S603",  # the service runs fixed system tools (blkid, mkfs.ext4, e2fsck, chattr) with fixed arguments
     "S607",  # by name, found through PATH as the unit sets it
 ]

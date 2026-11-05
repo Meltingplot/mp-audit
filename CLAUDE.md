@@ -37,7 +37,7 @@ Style and lint, with the tools pinned in `requirements-dev.txt` (`python3 -m ven
 pre-commit run --all-files    # ruff format, ruff check and shellcheck, with the rules in pyproject.toml
 ```
 
-Keep `%` formatting: it is the house style, and `UP031` is ignored on purpose. `ruff` finds `mp-audit` and `mp-auditd` only through `extend-include` in `pyproject.toml`, because they have no file extension.
+`ruff` finds `mp-audit` and `mp-auditd` only through `extend-include` in `pyproject.toml`, because they have no file extension.
 
 `.github/workflows/ci.yml` runs on every PR: those hooks and `systemd-analyze verify` on the unit, the tests on arm64 Debian trixie with apt's `python3-cryptography`, as on a device, and on Python 3.11 and 3.14 for the off-device check. Its actions are pinned to a commit, with the version beside it.
 
