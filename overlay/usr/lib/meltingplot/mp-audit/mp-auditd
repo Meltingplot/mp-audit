@@ -261,6 +261,20 @@ def mount_store(notes):
         )
         return None, None
     dev = os.path.realpath(DEV)
+    if not (holds_ext4(dev, notes) and passes_fsck(dev, notes)):
+        return None, dev
+    os.makedirs(STORE, mode=0o700, exist_ok=True)
+    try:
+        sys_mount(dev, STORE)
+    except OSError as exc:
+        notes.append(("E17", "failed", f"cannot mount the audit partition: {exc}", {}))
+        return None, dev
+    return STORE, dev
+
+
+def holds_ext4(dev, notes):
+    """Whether the partition holds ext4 now, formatting it only if it holds
+    nothing at all (AL-37)."""
     # --no-part-details: in low-level mode blkid also reports the partition's
     # entry in the partition table and then exits 0 for an empty partition,
     # which would never be formatted (layout gen4 ships it without a
@@ -273,29 +287,30 @@ def mount_store(notes):
         rc, _, err = run(["mkfs.ext4", "-q", "-L", "AUDIT", dev])
         if rc != 0:
             notes.append(("E17", "failed", "cannot format the empty audit partition: " + err, {}))
-            return None, dev
+            return False
         notes.append(("E17", "info", "empty audit partition formatted", {}))
-    elif rc != 0 or fstype != "ext4":
+        return True
+    if rc != 0 or fstype != "ext4":
         notes.append(("E17", "failed", f"audit partition holds {fstype!r}, not ext4; left as it is", {}))
-        return None, dev
+        return False
+    return True
+
+
+def passes_fsck(dev, notes):
+    """Whether the filesystem may be mounted. One mounted elsewhere cannot be
+    checked, and is worth an entry."""
     if mounted_elsewhere(dev):
         notes.append(("E17", "failed", "audit partition is mounted outside the audit service", {}))
-    else:
-        rc, _, err = run(["e2fsck", "-p", dev])
-        if rc >= E2FSCK_NOT_CORRECTED:
-            # Damaged: it may be the proof, so it is never repaired by force
-            # or formatted (AL-37).
-            notes.append(("E17", "failed", f"audit partition damaged (e2fsck {rc}), left as it is: {err[:120]}", {}))
-            return None, dev
-        if rc:
-            notes.append(("E17", "info", f"e2fsck repaired the audit partition ({rc})", {}))
-    os.makedirs(STORE, mode=0o700, exist_ok=True)
-    try:
-        sys_mount(dev, STORE)
-    except OSError as exc:
-        notes.append(("E17", "failed", f"cannot mount the audit partition: {exc}", {}))
-        return None, dev
-    return STORE, dev
+        return True
+    rc, _, err = run(["e2fsck", "-p", dev])
+    if rc >= E2FSCK_NOT_CORRECTED:
+        # Damaged: it may be the proof, so it is never repaired by force
+        # or formatted (AL-37).
+        notes.append(("E17", "failed", f"audit partition damaged (e2fsck {rc}), left as it is: {err[:120]}", {}))
+        return False
+    if rc:
+        notes.append(("E17", "info", f"e2fsck repaired the audit partition ({rc})", {}))
+    return True
 
 
 def sys_mount(dev, target):
@@ -386,22 +401,22 @@ class Service:
         self.next_trial_check = 0
 
     # entries of the service itself, also without a partition
-    def record(self, ev, res, msg="", obj="", actor="", via="mp-auditd", data=None, sync=False, force=False):
+    def record(self, ev, res, msg="", *, sync=False, force=False, **fields):
+        """fields are obj, actor, data and via, which is this service unless given."""
+        fields.setdefault("via", "mp-auditd")
         if self.core is not None:
             try:
-                return self.core.record(
-                    ev, res, actor=actor, via=via, obj=obj, msg=msg, data=data, sync=sync, force=force
-                )
+                return self.core.record(ev, res, msg=msg, sync=sync, force=force, **fields)
             except ValueError as exc:
                 log(str(exc))
                 return 0
         e = {"ev": ev, "res": res, "cls": al.class_of(ev, res), "msg": al.clean(msg, 256)}
-        if obj:
-            e["obj"] = al.clean(obj, 256)
-        if actor:
-            e["actor"] = al.clean(actor, 64)
-        if data:
-            e["data"] = al.clean_data(data)
+        if fields.get("obj"):
+            e["obj"] = al.clean(fields["obj"], 256)
+        if fields.get("actor"):
+            e["actor"] = al.clean(fields["actor"], 64)
+        if fields.get("data"):
+            e["data"] = al.clean_data(fields["data"])
         mirror(e, "journal only, " + self.reason)
         return 0
 
@@ -409,41 +424,25 @@ class Service:
         notes = []
         root, dev = mount_store(notes)
         if root is None:
-            self.mode = "journal-only"
-            self.reason = notes[-1][2] if notes else "no audit partition"
-            for ev, res, msg, data in notes:
-                self.record(ev, res, msg, data=data)
+            self.journal_only(notes[-1][2] if notes else "no audit partition")
+            self.record_notes(notes)
             return
         self.core = ac.AuditCore(root, self.pc.ident, journal=mirror, append_only=not TEST_STORE)
         try:
             state = self.core.open(recover=lost_in_crash)
         except Exception as exc:  # noqa: BLE001 - never a restart loop over the proof
             self.core = None
-            self.mode = "journal-only"
-            self.reason = f"audit log cannot be opened: {exc}"
+            self.journal_only(f"audit log cannot be opened: {exc}")
             self.record("E17", "failed", self.reason)
-            for ev, res, msg, data in notes:
-                self.record(ev, res, msg, data=data)
+            self.record_notes(notes)
             return
         self.mode = "log"
         installer = self.installer()
         if state == "new":
-            data = self.pc.identity_data(dev)
-            if installer:
-                data.update(
-                    {
-                        "installer": installer.get("installer", ""),
-                        "installed": installer.get("installed", ""),
-                        "layout_before": installer.get("layout_before", ""),
-                        "kept": installer.get("kept", ""),
-                    }
-                )
-            start = self.core.genesis(data=data)
-            log(f"audit log created, start hash {start}")
+            self.create_log(dev, installer)
         for kind, text in self.core.notes:
             self.record("E17", "failed" if kind in ("write", "rekey", "missing") else "info", text, data={"kind": kind})
-        for ev, res, msg, data in notes:
-            self.record(ev, res, msg, data=data)
+        self.record_notes(notes)
         if installer and installer.get("_sha") != self.core.extra.get("installer_sha"):
             self.installation(installer, state)
         if state == "open":
@@ -456,6 +455,28 @@ class Service:
         self.core.flush()
         self.core.seal()
         self.core.save_state()
+
+    def journal_only(self, reason):
+        self.mode = "journal-only"
+        self.reason = reason
+
+    def record_notes(self, notes):
+        for ev, res, msg, data in notes:
+            self.record(ev, res, msg, data=data)
+
+    def create_log(self, dev, installer):
+        data = self.pc.identity_data(dev)
+        if installer:
+            data.update(
+                {
+                    "installer": installer.get("installer", ""),
+                    "installed": installer.get("installed", ""),
+                    "layout_before": installer.get("layout_before", ""),
+                    "kept": installer.get("kept", ""),
+                }
+            )
+        start = self.core.genesis(data=data)
+        log(f"audit log created, start hash {start}")
 
     # E18 (AL-18): what the installer card found on the drive
     def installer(self):
@@ -720,6 +741,9 @@ class Handler(socketserver.StreamRequestHandler):
     def reply(self, obj):
         self.wfile.write((json.dumps(obj, sort_keys=True) + "\n").encode())
 
+    def refuse(self, error):
+        self.reply({"ok": False, "error": error})
+
     def handle(self):
         svc = self.server.svc
         self.request.settimeout(10)
@@ -730,60 +754,71 @@ class Handler(socketserver.StreamRequestHandler):
             if not isinstance(req, dict):
                 raise ValueError("not an object")
         except (OSError, ValueError) as exc:
-            self.reply({"ok": False, "error": f"bad request: {exc}"})
+            self.refuse(f"bad request: {exc}")
             return
         cmd = req.get("cmd")
+        # A command is whatever JSON the caller sent, so not always hashable.
+        command = self.COMMANDS.get(cmd) if isinstance(cmd, str) else None
         try:
-            if cmd == "record":
-                if uid != 0:
-                    self.reply({"ok": False, "error": "only root records"})
-                    return
-                if req.get("ev") not in al.EVENTS or req.get("res") not in al.RESULTS:
-                    self.reply({"ok": False, "error": "unknown event or result"})
-                    return
-                via = req.get("via") or read_text(f"/proc/{pid}/comm")
-                seq = svc.record(
-                    req.get("ev"),
-                    req.get("res"),
-                    msg=req.get("msg", ""),
-                    obj=req.get("obj", ""),
-                    actor=req.get("actor", ""),
-                    via=via,
-                    data=req.get("data"),
-                    sync=bool(req.get("sync")),
-                )
-                self.reply({"ok": True, "seq": seq, "mode": svc.mode})
-            elif cmd == "status":
-                self.reply(dict(svc.status(), ok=True))
-            elif cmd == "read":
-                if svc.core is None:
-                    self.reply({"ok": False, "error": svc.reason})
-                    return
-                # With the summaries still open at this moment, so a check
-                # accounts for every number (AL-41).
-                opened, snap = svc.core.read_snapshot()
-                self.reply({"ok": True, "start": svc.core.start, "open": opened})
-                for line in svc.core.lines(snap):
-                    self.wfile.write(line.encode("utf-8", "surrogateescape") + b"\n")
-            elif cmd == "seal":
-                if uid != 0 or svc.core is None:
-                    self.reply({"ok": False, "error": "not possible"})
-                    return
-                svc.core.seal()
-                self.reply({"ok": True})
-            elif cmd == "reset":
-                reason = al.clean(req.get("reason", ""), 200).strip()
-                if uid != 0 or svc.core is None or not reason:
-                    self.reply({"ok": False, "error": "a reset needs root, the audit partition and a reason"})
-                    return
-                start = svc.core.reset(reason, req.get("actor", "") or "uid 0", data=svc.pc.identity_data(None))
-                self.reply({"ok": True, "start": start, "fingerprint": al.fingerprint(start)})
+            if command is None:
+                self.refuse(f"unknown command {cmd!r}")
             else:
-                self.reply({"ok": False, "error": f"unknown command {cmd!r}"})
+                command(self, svc, req, pid, uid)
         except ValueError as exc:
-            self.reply({"ok": False, "error": str(exc)})
+            self.refuse(str(exc))
         except OSError:
             pass
+
+    def do_record(self, svc, req, pid, uid):
+        if uid != 0:
+            self.refuse("only root records")
+            return
+        if req.get("ev") not in al.EVENTS or req.get("res") not in al.RESULTS:
+            self.refuse("unknown event or result")
+            return
+        via = req.get("via") or read_text(f"/proc/{pid}/comm")
+        seq = svc.record(
+            req.get("ev"),
+            req.get("res"),
+            msg=req.get("msg", ""),
+            obj=req.get("obj", ""),
+            actor=req.get("actor", ""),
+            via=via,
+            data=req.get("data"),
+            sync=bool(req.get("sync")),
+        )
+        self.reply({"ok": True, "seq": seq, "mode": svc.mode})
+
+    def do_status(self, svc, _req, _pid, _uid):
+        self.reply(dict(svc.status(), ok=True))
+
+    def do_read(self, svc, _req, _pid, _uid):
+        if svc.core is None:
+            self.refuse(svc.reason)
+            return
+        # With the summaries still open at this moment, so a check
+        # accounts for every number (AL-41).
+        opened, snap = svc.core.read_snapshot()
+        self.reply({"ok": True, "start": svc.core.start, "open": opened})
+        for line in svc.core.lines(snap):
+            self.wfile.write(line.encode("utf-8", "surrogateescape") + b"\n")
+
+    def do_seal(self, svc, _req, _pid, uid):
+        if uid != 0 or svc.core is None:
+            self.refuse("not possible")
+            return
+        svc.core.seal()
+        self.reply({"ok": True})
+
+    def do_reset(self, svc, req, _pid, uid):
+        reason = al.clean(req.get("reason", ""), 200).strip()
+        if uid != 0 or svc.core is None or not reason:
+            self.refuse("a reset needs root, the audit partition and a reason")
+            return
+        start = svc.core.reset(reason, req.get("actor", "") or "uid 0", data=svc.pc.identity_data(None))
+        self.reply({"ok": True, "start": start, "fingerprint": al.fingerprint(start)})
+
+    COMMANDS = {"record": do_record, "status": do_status, "read": do_read, "seal": do_seal, "reset": do_reset}
 
 
 class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
