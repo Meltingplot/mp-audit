@@ -1,0 +1,4 @@
+# Formatting only. To have git blame skip it:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+# style: format the Python with ruff
+fbb9a1f5af1f78865358658000a8db76ebaabb86

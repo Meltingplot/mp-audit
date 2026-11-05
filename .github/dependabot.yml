@@ -1,0 +1,15 @@
+# Keeps what the CI and development use up to date: the actions, pinned to a
+# commit, and the tools in requirements-dev.txt. Nothing here reaches a device;
+# the image takes python3-cryptography from Debian.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly

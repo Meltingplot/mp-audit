@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-The audit log of the Meltingplot printer computers, a compliance record under the Machinery Regulation (EU 2023/1230, Annex III 1.1.9): a Python service and command line tool that go into the Raspberry Pi images. There is no build step, lint configuration or CI here. [Meltingplot/rpi-image-gen](https://github.com/Meltingplot/rpi-image-gen) pins this repository as the submodule `meltingplot/mp-audit` and runs `test/*.sh` in its CI at the pinned commit.
+The audit log of the Meltingplot printer computers, a compliance record under the Machinery Regulation (EU 2023/1230, Annex III 1.1.9): a Python service and command line tool that go into the Raspberry Pi images. There is no build step. [Meltingplot/rpi-image-gen](https://github.com/Meltingplot/rpi-image-gen) pins this repository as the submodule `meltingplot/mp-audit` and runs every `test/*.sh` in its CI under `dash` at the pinned commit, so a script there has to be a test and POSIX.
 
 Requirements and proof: `docs/meltingplot-audit-log.md`. What is done and what comes next: `docs/phase-plan.md`.
 
@@ -31,7 +31,17 @@ Check a log off the device, with nothing but the tool and `auditlog.py`:
 python3 -I -B overlay/usr/bin/mp-audit verify --start HASH FILE...
 ```
 
-Always use `-B` here. Everything under `overlay/` goes into the image as it is, and there is no `.gitignore`, so a `__pycache__` beside the modules could get committed and shipped.
+Style and lint, with the tools pinned in `requirements-dev.txt` (`python3 -m venv .venv`, activate it, `pip install -r requirements-dev.txt`):
+
+```sh
+pre-commit run --all-files    # ruff format, ruff check and shellcheck, with the rules in pyproject.toml
+```
+
+Keep `%` formatting: it is the house style, and `UP031` is ignored on purpose. `ruff` finds `mp-audit` and `mp-auditd` only through `extend-include` in `pyproject.toml`, because they have no file extension.
+
+`.github/workflows/ci.yml` runs on every PR: those hooks and `systemd-analyze verify` on the unit, the tests on arm64 Debian trixie with apt's `python3-cryptography`, as on a device, and on Python 3.11 and 3.14 for the off-device check. Its actions are pinned to a commit, with the version beside it.
+
+Always use `-B` here. Everything under `overlay/` goes into the image as it is, so a `__pycache__` beside the modules would ship in a local build, even though `.gitignore` keeps it out of commits.
 
 To run the service by hand, copy the environment from `test_service()`: `MP_AUDIT_STORE` puts the log in a plain directory instead of on the partition, and the other `MP_*` variables redirect its paths and stub `journalctl` and `systemctl`.
 
@@ -89,9 +99,9 @@ Ask Tim first before anything destructive: a log reset, `mkfs`, a reflash or a r
 
 ## Working here
 
-- **Every change goes through a PR, and Tim merges.** Run the tests, open the PR and stop there.
+- **Every change goes through a PR, and Tim merges.** Run the hooks and the tests, open the PR, see the CI pass and stop there.
 - **The image follows separately.** After the merge, a PR of its own in rpi-image-gen moves the submodule (commands in the README). A final image release needs a tag on that commit.
-- **Commit subjects are `area: what changed`**, such as `auditcore:`, `mp-auditd:` or `docs:`. The `meltingplot:` prefix on older commits comes from the import. Bodies are prose: why, the AL-nn and decisions concerned, and what was seen on a device.
+- **Commit subjects are `area: what changed`**, such as `auditcore:`, `mp-auditd:`, `docs:` or `ci:`. The `meltingplot:` prefix on older commits comes from the import. Formatting goes in a commit of its own, listed in `.git-blame-ignore-revs`. Bodies are prose: why, the AL-nn and decisions concerned, and what was seen on a device.
 - **Requirements:** if a change would depart from them or needs a new numbered decision, ask Tim before coding. Then requirement text, code and tests change in one PR, with the decision recorded as "(Tim, date)". Numbers are never reused or renumbered, because the source cites them.
 - **Citations:** AL-nn, E01 to E23, T-nn and decision nn ("Festlegung nn") refer to `docs/meltingplot-audit-log.md`; LY-nn refers to `docs/meltingplot-layout.md` in rpi-image-gen. Cite them in comments the way the code does.
 - **Language:** source, comments, README and commits are in English; the requirements and the phase plan are in German.

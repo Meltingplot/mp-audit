@@ -28,6 +28,7 @@ there:
 | `overlay/usr/lib/meltingplot/mp-audit/auditlog.py` | format, hash chain and signatures, also for checking a log off the device |
 | `overlay/usr/lib/systemd/system/mp-audit.service` | the unit |
 | `test/` | the tests, which run on a build host |
+| `pyproject.toml`, `requirements-dev.txt`, `.pre-commit-config.yaml`, `.github/` | the metadata, the tools and the CI; none of it goes into the image |
 | `docs/meltingplot-audit-log.md` | the requirements and their proof, in German. The mentions of that path and the numbers AL-nn, E01 to E23 and "decision nn" in the source refer to it |
 | `docs/phase-plan.md` | the phase plan: what is done, what comes next (in German, like the requirements) |
 
@@ -47,7 +48,30 @@ seconds.
 sh test/test-mp-audit.sh
 ```
 
-The image's CI runs them at the pinned commit.
+The CI here runs them on every change: on arm64 Debian trixie with its own
+Python and `python3-cryptography`, as on a device, and on the oldest and a
+current Python, for the check of a log off the device. The image's CI runs every
+`test/*.sh` at the pinned commit, under `dash`.
+
+## Style and lint
+
+ruff formats and lints the Python and shellcheck checks the shell, both pinned
+in `requirements-dev.txt`. The rules are in `pyproject.toml`. The CI runs the same
+hooks and fails on a file the formatter would change.
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements-dev.txt
+pre-commit run --all-files
+```
+
+`pre-commit install` runs them on every commit, as long as the environment is
+active. To have `git blame` skip the commit that formatted everything:
+
+```sh
+git config blame.ignoreRevsFile .git-blame-ignore-revs
+```
 
 ## Getting a change into the image
 
