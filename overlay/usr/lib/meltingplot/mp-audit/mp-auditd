@@ -239,7 +239,12 @@ def mount_store(notes):
                       "this computer has to be moved to layout gen3 with the installer card", {}))
         return None, None
     dev = os.path.realpath(DEV)
-    rc, fstype, _ = run(["blkid", "-p", "-o", "value", "-s", "TYPE", dev], 30)
+    # --no-part-details: in low-level mode blkid also reports the partition's
+    # entry in the partition table and then exits 0 for an empty partition,
+    # which would never be formatted (layout gen4 ships it without a
+    # filesystem; found on the bench panel with hmi rc.15). Without them, 2
+    # means no signature of any kind.
+    rc, fstype, _ = run(["blkid", "-p", "--no-part-details", "-o", "value", "-s", "TYPE", dev], 30)
     if rc == 2:
         # Nothing at all on it: a first start after an installation that did
         # not bring a filesystem. Anything else is left as it is.
