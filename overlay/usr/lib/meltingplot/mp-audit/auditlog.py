@@ -465,7 +465,8 @@ class _Check:
         elif short > 0 and self.announced and short >= len(self.announced):
             self._from_files(short)
         elif short != 0:
-            self._note(rep.lines, f"{rep.accounted} events counted, {rep.last_seq} numbered")
+            # :d here and below: a number in the log can be JSON true, and is one.
+            self._note(rep.lines, f"{rep.accounted} events counted, {rep.last_seq:d} numbered")
         return rep
 
     def _from_service(self, open_summaries):
@@ -475,7 +476,7 @@ class _Check:
         top = max([rep.last_seq] + [o.get("to") or 0 for o in open_summaries])
         held = sum(o.get("n", 0) for o in open_summaries)
         if rep.accounted + held != top:
-            self._note(rep.lines, f"{rep.accounted} events counted and {held} in open summaries, {top} numbered")
+            self._note(rep.lines, f"{rep.accounted} events counted and {held} in open summaries, {top:d} numbered")
         else:
             rep.last_seq = top
             rep.pending = held
@@ -495,7 +496,7 @@ class _Check:
             if before > explained:
                 self._note(
                     rep.lines,
-                    f"{before} numbers missing before the first open summary ({first}), "
+                    f"{before} numbers missing before the first open summary ({first:d}), "
                     f"{explained} in summaries written or declared lost",
                 )
         if not rep.problems:

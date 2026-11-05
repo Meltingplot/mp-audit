@@ -258,7 +258,7 @@ def cmd_verify(args):
             )
         print(f"lines        {rep.lines}: {rep.entries} entries, {rep.seals} seals, {rep.epochs_valid} epochs valid")
         print(f"open epoch   {rep.unsealed} entries not sealed yet")
-        print(f"numbers      1..{rep.last_seq}, {rep.aggregated} counted in summaries, {rep.lost} lost")
+        print(f"numbers      1..{rep.last_seq:d}, {rep.aggregated} counted in summaries, {rep.lost} lost")
         if rep.pending:
             print(
                 f"open         {rep.pending} {'counted' if opened is not None else 'at least'} "
