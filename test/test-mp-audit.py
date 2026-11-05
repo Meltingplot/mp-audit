@@ -25,6 +25,9 @@ What matters (docs/meltingplot-audit-log.md):
   runs is recorded (E17, T36).
 """
 
+import contextlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -50,7 +53,7 @@ sys.path.insert(0, LIB)
 import auditcore as ac  # noqa: E402
 import auditlog as al  # noqa: E402
 
-failed = 0
+failures = []
 # fsync is cheap on a tmpfs; the flood test writes for thirty simulated days
 SCRATCH = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
 
@@ -60,12 +63,11 @@ def mkdtemp():
 
 
 def check(name, want, got, detail=None):
-    global failed
     if want == got:
         print(f"ok   {name!s:<60} {got if detail is None else detail}")
     else:
         print(f"FAIL {name!s:<60} expected={want!r} got={got!r} {'' if detail is None else detail}")
-        failed = 1
+        failures.append(name)
 
 
 class Clock:
@@ -620,9 +622,6 @@ def test_clock():
 
 
 def load_daemon():
-    import importlib.machinery
-    import importlib.util
-
     loader = importlib.machinery.SourceFileLoader("mp_auditd", DAEMON)
     spec = importlib.util.spec_from_loader("mp_auditd", loader)
     mod = importlib.util.module_from_spec(spec)
@@ -733,68 +732,98 @@ def cli(env, *args):
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
     )
     return p.returncode, p.stdout, p.stderr
 
 
-def test_service():
-    # Not on SCRATCH: the stubs below have to run, and a container mounts
-    # /dev/shm noexec. This test does not write enough for fsync to matter.
-    tmp = tempfile.mkdtemp()
-    run = os.path.join(tmp, "run")
-    store = os.path.join(tmp, "store")
-    os.makedirs(store)
-    with open(os.path.join(tmp, "device.conf"), "w") as f:
-        f.write("MP_ROLE=hmi\nMP_PRODUCT=chx-350\nMP_IMAGE=mp-hmi-pi5\nMP_VERSION=0.0.0-test\n")
-    with open(os.path.join(tmp, "identity"), "w") as f:
-        f.write("PRINTER_SERIAL=001\nPRINTER_NAME=Halle 2\n")
-    with open(os.path.join(tmp, "installer.txt"), "w") as f:
-        f.write("image=mp-hmi-pi5-0.0.0-test\ninstaller=0.0.0-test\nlayout_before=gen2\nkeep_part=audit\nkept=no\n")
-    stub = os.path.join(tmp, "journalctl")
-    with open(stub, "w") as f:
-        f.write("#!/bin/sh\nexit 0\n")
-    os.chmod(stub, 0o755)
-    sysstate = os.path.join(tmp, "system-state")
-    with open(sysstate, "w") as f:
-        f.write("running\n")
-    systemctl = os.path.join(tmp, "systemctl")
-    with open(systemctl, "w") as f:
-        f.write(f"#!/bin/sh\ncat '{sysstate}'\n")
-    os.chmod(systemctl, 0o755)
-    jsock = os.path.join(tmp, "journal.sock")
-    journal = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    journal.bind(jsock)
-    journal.settimeout(0.2)
-    env = dict(
-        os.environ,
-        MP_AUDIT_RUN=run,
-        MP_AUDIT_STORE=store,
-        MP_DEVICE_CONF=os.path.join(tmp, "device.conf"),
-        MP_IDENTITY_FILE=os.path.join(tmp, "identity"),
-        MP_AUDIT_INSTALLER=os.path.join(tmp, "installer.txt"),
-        MP_AUDIT_JOURNAL=jsock,
-        MP_AUDIT_JOURNALCTL=stub,
-        MP_AUDIT_SYSTEMCTL=systemctl,
-        MP_AUDIT_SOCKET=os.path.join(run, "socket"),
-    )
-    env.pop("NOTIFY_SOCKET", None)
+class Bench:
+    """The real service and tool on a plain directory, with stubs for what
+    only a device has."""
 
-    def start():
+    def __init__(self):
+        # Not on SCRATCH: the stubs below have to run, and a container mounts
+        # /dev/shm noexec. This test does not write enough for fsync to matter.
+        self.tmp = tempfile.mkdtemp()
+        self.write("device.conf", "MP_ROLE=hmi\nMP_PRODUCT=chx-350\nMP_IMAGE=mp-hmi-pi5\nMP_VERSION=0.0.0-test\n")
+        self.write("identity", "PRINTER_SERIAL=001\nPRINTER_NAME=Halle 2\n")
+        self.write(
+            "installer.txt",
+            "image=mp-hmi-pi5-0.0.0-test\ninstaller=0.0.0-test\nlayout_before=gen2\nkeep_part=audit\nkept=no\n",
+        )
+        self.system_is("running")
+        sysstate = self.path("system-state")
+        self.write("journalctl", "#!/bin/sh\nexit 0\n", executable=True)
+        self.write("systemctl", f"#!/bin/sh\ncat '{sysstate}'\n", executable=True)
+        os.makedirs(self.path("store"))
+        self.journal = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.journal.bind(self.path("journal.sock"))
+        self.journal.settimeout(0.2)
+        self.env = dict(
+            os.environ,
+            MP_AUDIT_RUN=self.path("run"),
+            MP_AUDIT_STORE=self.path("store"),
+            MP_DEVICE_CONF=self.path("device.conf"),
+            MP_IDENTITY_FILE=self.path("identity"),
+            MP_AUDIT_INSTALLER=self.path("installer.txt"),
+            MP_AUDIT_JOURNAL=self.path("journal.sock"),
+            MP_AUDIT_JOURNALCTL=self.path("journalctl"),
+            MP_AUDIT_SYSTEMCTL=self.path("systemctl"),
+            MP_AUDIT_SOCKET=os.path.join(self.path("run"), "socket"),
+        )
+        self.env.pop("NOTIFY_SOCKET", None)
+
+    def path(self, name):
+        return os.path.join(self.tmp, name)
+
+    def write(self, name, text, executable=False):
+        with open(self.path(name), "w") as f:
+            f.write(text)
+        if executable:
+            os.chmod(self.path(name), 0o755)
+
+    def system_is(self, state):
+        self.write("system-state", state + "\n")
+
+    def start(self):
         p = subprocess.Popen(
-            [sys.executable, "-I", "-B", DAEMON], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            [sys.executable, "-I", "-B", DAEMON], env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         for _ in range(100):
-            if cli(env, "status")[0] in (0, 2):
+            if cli(self.env, "status")[0] in (0, 2):
                 break
             time.sleep(0.1)
         return p
 
-    p = start()
-    rc, out, err = cli(env, "status", "--json")
+    @staticmethod
+    def stop(p):
+        p.send_signal(signal.SIGTERM)
+        p.wait(timeout=30)
+
+    def msgs(self):
+        _, out, _ = cli(self.env, "show", "--all", "--json")
+        return [(json.loads(x)["ev"], json.loads(x).get("msg", "")) for x in out.splitlines()]
+
+    def queued(self):
+        """What reached the journal next, if anything."""
+        with contextlib.suppress(TimeoutError):
+            return self.journal.recv(65536)
+        return b""
+
+    def close(self):
+        self.journal.close()
+        shutil.rmtree(self.tmp)
+
+
+def service_first_start(bench):
+    """Returns the start hash of the log."""
+    env = bench.env
+    p = bench.start()
+    _, out, _ = cli(env, "status", "--json")
     st = json.loads(out) if out else {}
     check("service: runs on its store", "log", st.get("mode"))
     check("service: has a start hash", 64, len(st.get("start") or ""))
-    rc, out, _ = cli(env, "show", "--all", "--json")
+    _, out, _ = cli(env, "show", "--all", "--json")
     evs = [json.loads(x)["ev"] for x in out.splitlines()]
     check("service: begins with E01, then the installation (E18)", ["E01", "E18"], evs[:2])
     e18 = json.loads(out.splitlines()[1])
@@ -805,21 +834,19 @@ def test_service():
     check("service: the first start records the image (E02)", "E02", evs[2] if len(evs) > 2 else None)
     rc, _, err = cli(dict(env, MP_AUDIT_UID="1000"), "record", "E10", "refused", "--actor", "1-1")
     check("service: only root records", (2, "mp-audit: only root records"), (rc, err.strip()))
-    rc, out, _ = cli(env, "verify", "--start", st.get("start", ""))
+    rc, _, _ = cli(env, "verify", "--start", st.get("start", ""))
     check("service: verify on the device", 0, rc)
-    p.send_signal(signal.SIGTERM)
-    p.wait(timeout=30)
+    bench.stop(p)
     check("service: clean stop", 0, p.returncode)
+    return st.get("start", "")
 
-    def msgs():
-        rc, out, _ = cli(env, "show", "--all", "--json")
-        return [(json.loads(x)["ev"], json.loads(x).get("msg", "")) for x in out.splitlines()]
 
-    # T36: a stop while the system runs is recorded when it happens, and the
-    # start after it within the same boot says how long the gap was
+def service_stops(bench, start):
+    """T36: a stop while the system runs is recorded when it happens, and the
+    start after it within the same boot says how long the gap was."""
     stopped = ("E17", "the audit service was stopped while the system runs")
-    p = start()
-    got = msgs()
+    p = bench.start()
+    got = bench.msgs()
     again = [m for e, m in got if e == "E17" and m.startswith("the audit service started again within this boot")]
     check("service: a stop while the system runs is an E17", 1, got.count(stopped), [e for e, _ in got])
     check(
@@ -827,84 +854,84 @@ def test_service():
         (1, False),
         (len(again), any(e == "E15" for e, _ in got)),
     )
-    with open(sysstate, "w") as f:
-        f.write("stopping\n")
-    p.send_signal(signal.SIGTERM)
-    p.wait(timeout=30)
-    p = start()
-    check("service: a stop at shutdown adds no E17", 1, msgs().count(stopped))
-    with open(sysstate, "w") as f:
-        f.write("running\n")
+    bench.system_is("stopping")
+    bench.stop(p)
+    p = bench.start()
+    check("service: a stop at shutdown adds no E17", 1, bench.msgs().count(stopped))
+    bench.system_is("running")
     p.kill()
     p.wait()
-    p = start()
-    got = msgs()
+    p = bench.start()
+    got = bench.msgs()
     check(
         "service: a killed service is an E17 at the next start",
         True,
         ("E17", "the audit service was restarted without a clean stop") in got,
         [e for e, _ in got],
     )
-    rc, out, _ = cli(env, "verify", "--start", st.get("start", ""))
+    rc, _, _ = cli(bench.env, "verify", "--start", start)
     check("service: still valid after the kill", 0, rc)
-    p.send_signal(signal.SIGTERM)
-    p.wait(timeout=30)
+    bench.stop(p)
 
-    # AL-35: the service not there, the entry waits in the journal
-    while True:
-        try:
-            journal.recv(65536)
-        except TimeoutError:
-            break
-    nowhere = dict(env, MP_AUDIT_SOCKET=os.path.join(tmp, "nowhere"))
-    rc, _, err = cli(
-        dict(nowhere, MP_AUDIT_UID="0"), "record", "E10", "refused", "--actor", "1-1", "--obj", "046a:0011"
-    )
-    got = b""
-    try:
-        got = journal.recv(65536)
-    except TimeoutError:
+
+def service_away(bench):
+    """AL-35: the service not there, the entry waits in the journal."""
+    while bench.queued():
         pass
-    check("record: without the service it queues in the journal", (0, True), (rc, b"MP_AUDIT_PENDING=1" in got))
+    nowhere = dict(bench.env, MP_AUDIT_SOCKET=bench.path("nowhere"))
+    rc, _, _ = cli(dict(nowhere, MP_AUDIT_UID="0"), "record", "E10", "refused", "--actor", "1-1", "--obj", "046a:0011")
+    check(
+        "record: without the service it queues in the journal", (0, True), (rc, b"MP_AUDIT_PENDING=1" in bench.queued())
+    )
     # Decision 23: without root nothing goes into the journal; the service
     # would not take it over anyway
     rc, _, err = cli(dict(nowhere, MP_AUDIT_UID="1000"), "record", "E10", "refused", "--actor", "1-1")
-    got = b""
-    try:
-        got = journal.recv(65536)
-    except TimeoutError:
-        pass
     check(
         "record: without root it refuses and queues nothing",
         (2, False),
-        (rc, b"MP_AUDIT_PENDING=1" in got),
+        (rc, b"MP_AUDIT_PENDING=1" in bench.queued()),
         err.strip(),
     )
-    journal.close()
-    shutil.rmtree(tmp)
+
+
+def test_service():
+    bench = Bench()
+    start = service_first_start(bench)
+    service_stops(bench, start)
+    service_away(bench)
+    bench.close()
+
+
+TESTS = (
+    test_chain,
+    test_tamper,
+    test_restart,
+    test_crash,
+    test_lost_key,
+    test_strings,
+    test_parallel,
+    test_reset,
+    test_open_summary,
+    test_budget_design,
+    test_flood,
+    test_change_at_once,
+    test_wear,
+    test_clock,
+    test_trial,
+    test_service,
+)
 
 
 def main():
-    for t in (
-        test_chain,
-        test_tamper,
-        test_restart,
-        test_crash,
-        test_lost_key,
-        test_strings,
-        test_parallel,
-        test_reset,
-        test_open_summary,
-        test_budget_design,
-        test_flood,
-        test_change_at_once,
-        test_wear,
-        test_clock,
-        test_trial,
-        test_service,
-    ):
-        t()
-    sys.exit(failed)
+    """All tests, or those named on the command line, such as test_chain."""
+    by_name = {t.__name__: t for t in TESTS}
+    chosen = sys.argv[1:] or list(by_name)
+    unknown = [name for name in chosen if name not in by_name]
+    if unknown:
+        sys.exit(f"unknown tests: {', '.join(unknown)}; there are: {', '.join(by_name)}")
+    for name in chosen:
+        by_name[name]()
+    sys.exit(1 if failures else 0)
 
 
 if __name__ == "__main__":

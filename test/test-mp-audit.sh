@@ -4,4 +4,4 @@
 # python3-cryptography on the build host.
 set -eu
 here=$(dirname "$(readlink -f "$0")")
-exec python3 -I -B "$here/test-mp-audit.py"
+exec python3 -I -B "$here/test-mp-audit.py" "$@"
