@@ -1,6 +1,6 @@
 # Phasenplan: Audit-Log
 
-Die Anforderungen stehen in [docs/meltingplot-audit-log.md](https://github.com/Meltingplot/rpi-image-gen/blob/meltingplot/docs/meltingplot-audit-log.md) im Repository Meltingplot/rpi-image-gen; darauf beziehen sich AL-nn, E01 bis E23, T-Nummern und „Festlegung nn“. LY-nn steht in [docs/meltingplot-layout.md](https://github.com/Meltingplot/rpi-image-gen/blob/meltingplot/docs/meltingplot-layout.md) dort.
+Die Anforderungen stehen in [meltingplot-audit-log.md](meltingplot-audit-log.md); darauf beziehen sich AL-nn, E01 bis E23, T-Nummern und „Festlegung nn“. LY-nn steht in [docs/meltingplot-layout.md](https://github.com/Meltingplot/rpi-image-gen/blob/meltingplot/docs/meltingplot-layout.md) im Repository Meltingplot/rpi-image-gen.
 
 **Zwei Phasen (Tim, 2026-11-04):**
 - **Phase 1:** Layout gen3 mit der Partition `audit` und eine Installerkarte, die gen1 und gen2 überführt und auf gen3 die Partition stehen lässt.

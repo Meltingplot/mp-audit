@@ -1,6 +1,6 @@
 [Unit]
 Description=Meltingplot audit log
-Documentation=https://github.com/Meltingplot/rpi-image-gen/blob/meltingplot/docs/meltingplot-audit-log.md
+Documentation=https://github.com/Meltingplot/mp-audit/blob/main/docs/meltingplot-audit-log.md
 # Early, so the services that change or open the computer find it running.
 # What happens before, the guards queue in the journal (AL-35).
 DefaultDependencies=no

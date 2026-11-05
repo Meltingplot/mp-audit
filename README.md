@@ -13,9 +13,6 @@ The image repository [Meltingplot/rpi-image-gen](https://github.com/Meltingplot/
 pins this repository as the submodule `meltingplot/mp-audit`. These parts stay
 there:
 
-- the requirements, [docs/meltingplot-audit-log.md](https://github.com/Meltingplot/rpi-image-gen/blob/meltingplot/docs/meltingplot-audit-log.md).
-  The mentions of that path and the numbers AL-nn, E01 to E23 and "decision nn"
-  in the source refer to it;
 - the layer `meltingplot/layer/mp-audit.yaml`, which takes the packages and
   enables the service;
 - the build's check that the budgets fit the partition, the hook
@@ -31,6 +28,7 @@ there:
 | `overlay/usr/lib/meltingplot/mp-audit/auditlog.py` | format, hash chain and signatures, also for checking a log off the device |
 | `overlay/usr/lib/systemd/system/mp-audit.service` | the unit |
 | `test/` | the tests, which run on a build host |
+| `docs/meltingplot-audit-log.md` | the requirements and their proof, in German. The mentions of that path and the numbers AL-nn, E01 to E23 and "decision nn" in the source refer to it |
 | `docs/phase-plan.md` | the phase plan: what is done, what comes next (in German, like the requirements) |
 
 Everything under `overlay/` goes into the image as it is, at the same path.
