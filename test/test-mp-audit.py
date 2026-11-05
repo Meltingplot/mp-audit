@@ -732,8 +732,7 @@ def cli(env, *args):
     p = subprocess.run(
         [sys.executable, "-I", "-B", CLI] + list(args),
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
         timeout=60,
     )
@@ -855,7 +854,7 @@ def test_service():
     while True:
         try:
             journal.recv(65536)
-        except socket.timeout:
+        except TimeoutError:
             break
     nowhere = dict(env, MP_AUDIT_SOCKET=os.path.join(tmp, "nowhere"))
     rc, _, err = cli(
@@ -864,7 +863,7 @@ def test_service():
     got = b""
     try:
         got = journal.recv(65536)
-    except socket.timeout:
+    except TimeoutError:
         pass
     check("record: without the service it queues in the journal", (0, True), (rc, b"MP_AUDIT_PENDING=1" in got))
     # Decision 23: without root nothing goes into the journal; the service
@@ -873,7 +872,7 @@ def test_service():
     got = b""
     try:
         got = journal.recv(65536)
-    except socket.timeout:
+    except TimeoutError:
         pass
     check(
         "record: without root it refuses and queues nothing",

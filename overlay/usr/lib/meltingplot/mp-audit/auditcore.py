@@ -244,7 +244,7 @@ class AuditCore:
         self.key = None
         self.unsealed = 0
         self.last_ev = {}
-        self.used = {c: 0 for c in self.shares}
+        self.used = dict.fromkeys(self.shares, 0)
         self.buckets = {c: Bucket(s) for c, s in self.shares.items()}
         self.summaries = {}
         self.pending = []
@@ -335,7 +335,7 @@ class AuditCore:
         self._append(data)
         self.need_newline = False
         self.prev = prev
-        for obj, line in zip(objs, lines):
+        for obj, line in zip(objs, lines, strict=True):
             self._account(obj, len(line) + 1)
         return lines
 

@@ -11,9 +11,10 @@
 Requirements: docs/meltingplot-audit-log.md. Recording takes root (AL-10):
 without it, record stops at once with exit 2 and queues nothing (decision
 23). Showing and checking take root or the group adm, which the Connect
-account is in (AL-20); that is why this tool is in /usr/bin (decision 22). Given files, show and verify read those instead of asking the
-service, for instance an exported log on another computer, where this script
-and auditlog.py next to it are all it takes besides python3-cryptography.
+account is in (AL-20); that is why this tool is in /usr/bin (decision 22).
+Given files, show and verify read those instead of asking the service, for
+instance an exported log on another computer, where this script and
+auditlog.py next to it are all it takes besides python3-cryptography.
 
 When the service is not running, record as root puts the entry into the
 journal, marked as queued, and the service takes it over when it starts
@@ -59,7 +60,7 @@ def request(req, stream=False):
         s.connect(SOCK)
     except OSError as exc:
         s.close()
-        raise Unreachable(str(exc))
+        raise Unreachable(str(exc)) from exc
     f = s.makefile("rwb")
     f.write((json.dumps(req) + "\n").encode())
     f.flush()
