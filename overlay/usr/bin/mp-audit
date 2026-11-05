@@ -112,23 +112,38 @@ def parent_comm():
         return ""
 
 
+def complain(text, status):
+    print(f"mp-audit: {text}", file=sys.stderr)
+    return status
+
+
+def record_problem(args):
+    """What is wrong with the arguments of record, if anything."""
+    if args.event not in al.EVENTS:
+        return f"unknown event {args.event}"
+    if args.result not in al.RESULTS:
+        return f"result must be one of {', '.join(al.RESULTS)}"
+    if any("=" not in kv for kv in args.data or []):
+        return "--data takes KEY=VALUE"
+    return None
+
+
+def queue_record(req, why):
+    req["t"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        journal_queue(req)
+    except OSError:
+        return complain(f"audit service not reachable ({why}), and the journal neither", 1)
+    return complain("audit service not reachable, entry queued in the journal", 0)
+
+
 def cmd_record(args):
     if UID != 0:
-        print("mp-audit: only root records", file=sys.stderr)
-        return 2
-    if args.event not in al.EVENTS:
-        print(f"mp-audit: unknown event {args.event}", file=sys.stderr)
-        return 1
-    if args.result not in al.RESULTS:
-        print(f"mp-audit: result must be one of {', '.join(al.RESULTS)}", file=sys.stderr)
-        return 1
-    data = {}
-    for kv in args.data or []:
-        if "=" not in kv:
-            print("mp-audit: --data takes KEY=VALUE", file=sys.stderr)
-            return 1
-        k, v = kv.split("=", 1)
-        data[k] = v
+        return complain("only root records", 2)
+    problem = record_problem(args)
+    if problem:
+        return complain(problem, 1)
+    data = dict(kv.split("=", 1) for kv in args.data or [])
     req = {
         "cmd": "record",
         "ev": args.event,
@@ -143,17 +158,9 @@ def cmd_record(args):
     try:
         reply, _ = request(req)
     except Unreachable as exc:
-        req["t"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        try:
-            journal_queue(req)
-        except OSError:
-            print(f"mp-audit: audit service not reachable ({exc}), and the journal neither", file=sys.stderr)
-            return 1
-        print("mp-audit: audit service not reachable, entry queued in the journal", file=sys.stderr)
-        return 0
+        return queue_record(req, exc)
     if not reply.get("ok"):
-        print(f"mp-audit: {reply.get('error')}", file=sys.stderr)
-        return 2
+        return complain(reply.get("error"), 2)
     return 0
 
 
