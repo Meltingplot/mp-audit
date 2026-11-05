@@ -38,7 +38,7 @@ for _lib in (os.path.join(HERE, "..", "lib", "meltingplot", "mp-audit"), HERE):
         sys.path.insert(0, os.path.realpath(_lib))
         break
 
-import auditlog as al   # noqa: E402
+import auditlog as al  # noqa: E402
 
 SOCK = os.environ.get("MP_AUDIT_SOCKET", "/run/mp-audit/socket")
 JOURNAL_SOCKET = os.environ.get("MP_AUDIT_JOURNAL", "/run/systemd/journal/socket")
@@ -79,6 +79,7 @@ def request(req, stream=False):
                 yield raw.decode("utf-8", "surrogateescape").rstrip("\n")
         finally:
             s.close()
+
     return reply, lines()
 
 
@@ -127,9 +128,17 @@ def cmd_record(args):
             return 1
         k, v = kv.split("=", 1)
         data[k] = v
-    req = {"cmd": "record", "ev": args.event, "res": args.result, "actor": args.actor or "",
-           "obj": args.obj or "", "msg": args.msg or "", "data": data, "sync": args.sync,
-           "via": args.via or parent_comm()}
+    req = {
+        "cmd": "record",
+        "ev": args.event,
+        "res": args.result,
+        "actor": args.actor or "",
+        "obj": args.obj or "",
+        "msg": args.msg or "",
+        "data": data,
+        "sync": args.sync,
+        "via": args.via or parent_comm(),
+    }
     try:
         reply, _ = request(req)
     except Unreachable as exc:
@@ -151,11 +160,13 @@ def read_log(files):
     """Lines from files, or from the service. Returns (lines, start, open
     summaries); the last two only from the service."""
     if files:
+
         def gen():
             for path in files:
                 with open(path, "rb") as f:
                     for raw in f:
                         yield raw.decode("utf-8", "surrogateescape").rstrip("\n")
+
         return gen(), None, None
     reply, lines = request({"cmd": "read"}, stream=True)
     if not reply.get("ok"):
@@ -166,13 +177,13 @@ def read_log(files):
 
 def short(text, n):
     text = text or ""
-    return text if len(text) <= n else text[:n - 1] + "~"
+    return text if len(text) <= n else text[: n - 1] + "~"
 
 
 def format_entry(e):
     t = (e.get("t") or "").replace("T", " ")
     if not e.get("sync", True):
-        t += "?"            # the clock was not synchronised (AL-01)
+        t += "?"  # the clock was not synchronised (AL-01)
     head = "%7s %-21s %-3s %-10s" % (e.get("seq"), t, e.get("ev"), e.get("res"))
     who = e.get("actor") or e.get("via") or ""
     if e.get("agg"):
@@ -202,8 +213,10 @@ def cmd_show(args):
         if "seal" in e or "rekey" in e:
             if args.seals:
                 kind = "seal" if "seal" in e else "REKEY"
-                print("        %-21s %s of epoch %s" % ((e.get("t") or "").replace("T", " "), kind,
-                                                       e.get("seal", e.get("rekey"))))
+                print(
+                    "        %-21s %s of epoch %s"
+                    % ((e.get("t") or "").replace("T", " "), kind, e.get("seal", e.get("rekey")))
+                )
             continue
         if want and e.get("ev") not in want:
             continue
@@ -231,16 +244,26 @@ def cmd_verify(args):
         if args.start:
             print("anchor       %s (%s)" % (args.start, "matches" if rep.start == args.start else "DOES NOT MATCH"))
         else:
-            print("anchor       none given: the check shows the log is intact from its start, "
-                  "not that it is the log anchored on the nameplate")
-        print("lines        %d: %d entries, %d seals, %d epochs valid" % (rep.lines, rep.entries, rep.seals,
-                                                                         rep.epochs_valid))
+            print(
+                "anchor       none given: the check shows the log is intact from its start, "
+                "not that it is the log anchored on the nameplate"
+            )
+        print(
+            "lines        %d: %d entries, %d seals, %d epochs valid"
+            % (rep.lines, rep.entries, rep.seals, rep.epochs_valid)
+        )
         print("open epoch   %d entries not sealed yet" % rep.unsealed)
         print("numbers      1..%d, %d counted in summaries, %d lost" % (rep.last_seq, rep.aggregated, rep.lost))
         if rep.pending:
-            print("open         %d %s in summaries not written yet (%s)%s" % (
-                rep.pending, "counted" if opened is not None else "at least", ", ".join(rep.pending_keys),
-                "" if opened is not None else "; announced by E19, only the device can confirm them"))
+            print(
+                "open         %d %s in summaries not written yet (%s)%s"
+                % (
+                    rep.pending,
+                    "counted" if opened is not None else "at least",
+                    ", ".join(rep.pending_keys),
+                    "" if opened is not None else "; announced by E19, only the device can confirm them",
+                )
+            )
         if rep.torn:
             print("torn writes  %d" % rep.torn)
         for n, epoch, text in rep.problems:
@@ -255,8 +278,9 @@ def cmd_genesis(args):
         print("mp-audit: %s" % exc, file=sys.stderr)
         return 1
     if not reply.get("start"):
-        print("mp-audit: no audit log on this computer (%s)" % (reply.get("reason") or reply.get("mode")),
-              file=sys.stderr)
+        print(
+            "mp-audit: no audit log on this computer (%s)" % (reply.get("reason") or reply.get("mode")), file=sys.stderr
+        )
         return 1
     print("start hash   %s" % reply["start"])
     print("fingerprint  %s" % reply["fingerprint"])
@@ -334,8 +358,14 @@ def main():
     args = p.parse_args()
     if getattr(args, "start", None):
         args.start = args.start.strip().lower()
-    return {"record": cmd_record, "show": cmd_show, "verify": cmd_verify, "genesis": cmd_genesis,
-            "status": cmd_status, "reset": cmd_reset}[args.cmd](args)
+    return {
+        "record": cmd_record,
+        "show": cmd_show,
+        "verify": cmd_verify,
+        "genesis": cmd_genesis,
+        "status": cmd_status,
+        "reset": cmd_reset,
+    }[args.cmd](args)
 
 
 if __name__ == "__main__":
