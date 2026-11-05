@@ -28,7 +28,7 @@ there:
 | `overlay/usr/lib/meltingplot/mp-audit/auditlog.py` | format, hash chain and signatures, also for checking a log off the device |
 | `overlay/usr/lib/systemd/system/mp-audit.service` | the unit |
 | `test/` | the tests, which run on a build host |
-| `pyproject.toml`, `requirements-dev.txt`, `.pre-commit-config.yaml`, `.github/` | the metadata, the tools and the CI; none of it goes into the image |
+| `Makefile`, `CONTRIBUTING.md`, `pyproject.toml`, `requirements-dev.txt`, `.pre-commit-config.yaml`, `.github/` | the everyday commands, the metadata, the tools and the CI; none of it goes into the image |
 | `docs/meltingplot-audit-log.md` | the requirements and their proof, in German. The mentions of that path and the numbers AL-nn, E01 to E23 and "decision nn" in the source refer to it |
 | `docs/phase-plan.md` | the phase plan: what is done, what comes next (in German, like the requirements) |
 
@@ -60,14 +60,12 @@ in `requirements-dev.txt`. The rules are in `pyproject.toml`. The CI runs the sa
 hooks and fails on a file the formatter would change.
 
 ```sh
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements-dev.txt
-pre-commit run --all-files
+make lint     # style and lint
+make check    # that, the unit and the tests, as the CI does
 ```
 
-`pre-commit install` runs them on every commit, as long as the environment is
-active. To have `git blame` skip the commit that formatted everything:
+[CONTRIBUTING.md](CONTRIBUTING.md) has the rest. To have `git blame` skip the
+commit that formatted everything:
 
 ```sh
 git config blame.ignoreRevsFile .git-blame-ignore-revs

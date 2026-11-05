@@ -1,10 +1,11 @@
 # The project's metadata and the configuration of its tools. Nothing is built
 # from this: the image takes overlay/ as it is, at the commit it pins, and a tag
-# on that commit is the release (see the README).
+# on that commit is the release. The version here and that tag, v<version>, go
+# together (see CONTRIBUTING.md).
 
 [project]
 name = "mp-audit"
-version = "0.0.0"
+version = "0.1.0"
 description = "The audit log of the Meltingplot printer computers"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,6 +33,9 @@ select = [
     "C4",     # comprehensions
     "PIE",    # needless code
     "S",      # security
+    "SIM",    # simpler forms
+    "C90",    # complexity of a function
+    "PL",     # pylint: size of a function, its arguments and returns, magic values
     "RUF100", # noqa comments that do nothing
 ]
 ignore = [
@@ -43,5 +47,9 @@ ignore = [
 known-first-party = ["auditcore", "auditlog"]
 
 [tool.ruff.lint.per-file-ignores]
-# The tests run on a build host, on temporary directories, with their own stubs.
-"test/*" = ["S101", "S103", "S108"]
+# The image build imports auditcore, and with it this file, to read SHARES. That
+# must not need cryptography, so it is imported where it is used.
+"overlay/usr/lib/meltingplot/mp-audit/auditlog.py" = ["PLC0415"]
+# The tests run on a build host, on temporary directories, with their own stubs,
+# and compare with the numbers they expect.
+"test/*" = ["S101", "S103", "S108", "PLR2004"]
