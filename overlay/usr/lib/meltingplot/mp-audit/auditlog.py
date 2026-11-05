@@ -91,6 +91,7 @@ def class_of(ev, res):
 
 # --- canonical form -----------------------------------------------------------
 
+
 def canon(obj):
     """The one serialisation that is hashed and signed."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -104,7 +105,7 @@ def line_hash(line):
 
 def fingerprint(start):
     """The first 128 bits of a start hash in groups of four (AL-58)."""
-    return " ".join(start[i:i + 4] for i in range(0, 32, 4))
+    return " ".join(start[i : i + 4] for i in range(0, 32, 4))
 
 
 def b64(raw):
@@ -117,13 +118,14 @@ def unb64(text):
 
 # --- strings from outside (AL-02) ---------------------------------------------
 
+
 def clean(value, limit):
     """Bounded and free of control characters. Never interpreted."""
     text = str(value)
     out = []
     for ch in text[:limit]:
         o = ord(ch)
-        if o < 0x20 or o == 0x7f or 0x80 <= o < 0xa0:
+        if o < 0x20 or o == 0x7F or 0x80 <= o < 0xA0:
             out.append("\\x%02x" % o)
         else:
             out.append(ch)
@@ -143,7 +145,7 @@ def clean_data(data, keys=16, limit=256):
         v = data[k]
         if isinstance(v, bool) or v is None:
             out[key] = v
-        elif isinstance(v, int) and abs(v) < 2 ** 63:
+        elif isinstance(v, int) and abs(v) < 2**63:
             out[key] = v
         else:
             out[key] = clean(v, limit)
@@ -152,8 +154,10 @@ def clean_data(data, keys=16, limit=256):
 
 # --- keys ----------------------------------------------------------------------
 
+
 def _ec():
     from cryptography.hazmat.primitives.asymmetric import ec
+
     return ec
 
 
@@ -173,19 +177,21 @@ def key_from_bytes(raw):
 
 def public_text(key):
     from cryptography.hazmat.primitives import serialization
-    raw = key.public_key().public_bytes(
-        serialization.Encoding.X962, serialization.PublicFormat.CompressedPoint)
+
+    raw = key.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.CompressedPoint)
     return b64(raw)
 
 
 def sign(key, payload):
     from cryptography.hazmat.primitives import hashes
+
     return b64(key.sign(payload.encode("ascii"), _ec().ECDSA(hashes.SHA256())))
 
 
 def signature_valid(pub, sig, payload):
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives import hashes
+
     ec = _ec()
     try:
         key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), unb64(pub))
@@ -200,6 +206,7 @@ def seal_payload(seal):
 
 
 # --- check (AL-61) -------------------------------------------------------------
+
 
 class Report:
     """What the check found. "result" is the verdict:
@@ -230,8 +237,8 @@ class Report:
         self.entries = 0
         self.seals = 0
         self.epochs_valid = 0
-        self.problems = []      # (line number, epoch, text)
-        self.unsealed = 0       # entries after the last seal
+        self.problems = []  # (line number, epoch, text)
+        self.unsealed = 0  # entries after the last seal
         self.last_seq = 0
         self.last_hash = ZERO
         self.accounted = 0
@@ -239,9 +246,9 @@ class Report:
         self.aggregated = 0
         self.torn = 0
         self.rekeys = 0
-        self.pending = 0        # numbers in summaries not written yet
+        self.pending = 0  # numbers in summaries not written yet
         self.pending_keys = []  # their class/id
-        self.confirmed = True   # pending as the service said, not inferred
+        self.confirmed = True  # pending as the service said, not inferred
 
     @property
     def result(self):
@@ -291,14 +298,14 @@ def verify(lines, start=None, open_summaries=None):
     entries announce summaries that no summary entry has closed yet.
     """
     rep = Report()
-    announced = {}          # E19 not yet followed by its summary entry
-    gaps = []               # (first, last) of numbers no entry carries
+    announced = {}  # E19 not yet followed by its summary entry
+    gaps = []  # (first, last) of numbers no entry carries
     rep.start_expected = start
     prev = ZERO
     pub = None
     epoch = 0
     epoch_ok = True
-    pending_torn = None     # (line number, hash) of an unreadable line
+    pending_torn = None  # (line number, hash) of an unreadable line
     for n, raw in enumerate(lines, 1):
         line = raw.rstrip("\n")
         if not line:
@@ -414,8 +421,13 @@ def verify(lines, start=None, open_summaries=None):
         top = max([rep.last_seq] + [o.get("to") or 0 for o in open_summaries])
         held = sum(o.get("n", 0) for o in open_summaries)
         if rep.accounted + held != top:
-            rep.problems.append((rep.lines, epoch, "%d events counted and %d in open summaries, %d numbered"
-                                 % (rep.accounted, held, top)))
+            rep.problems.append(
+                (
+                    rep.lines,
+                    epoch,
+                    "%d events counted and %d in open summaries, %d numbered" % (rep.accounted, held, top),
+                )
+            )
         else:
             rep.last_seq = top
             rep.pending = held
@@ -431,13 +443,18 @@ def verify(lines, start=None, open_summaries=None):
             before = sum(min(b, first - 1) - a + 1 for a, b in gaps if a < first)
             explained = rep.aggregated + rep.lost
             if before > explained:
-                rep.problems.append((rep.lines, epoch, "%d numbers missing before the first open summary (%d), "
-                                     "%d in summaries written or declared lost" % (before, first, explained)))
+                rep.problems.append(
+                    (
+                        rep.lines,
+                        epoch,
+                        "%d numbers missing before the first open summary (%d), "
+                        "%d in summaries written or declared lost" % (before, first, explained),
+                    )
+                )
         if not rep.problems:
             rep.pending = short
             rep.pending_keys = sorted(set(announced.values()))
             rep.confirmed = False
     elif short != 0:
-        rep.problems.append((rep.lines, epoch,
-                             "%d events counted, %d numbered" % (rep.accounted, rep.last_seq)))
+        rep.problems.append((rep.lines, epoch, "%d events counted, %d numbered" % (rep.accounted, rep.last_seq)))
     return rep

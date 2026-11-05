@@ -1,0 +1,23 @@
+# The tools come from requirements-dev.txt, so their versions are pinned in one
+# place, and the CI runs these same hooks. Which files ruff checks is set in
+# pyproject.toml, because the service and the tool have no file extension.
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff format
+        entry: ruff format
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: ruff-check
+        name: ruff check
+        entry: ruff check
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: shellcheck
+        name: shellcheck
+        entry: shellcheck
+        language: system
+        types: [shell]

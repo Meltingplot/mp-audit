@@ -1,0 +1,48 @@
+# The project's metadata and the configuration of its tools. Nothing is built
+# from this: the image takes overlay/ as it is, at the commit it pins, and a tag
+# on that commit is the release (see the README).
+
+[project]
+name = "mp-audit"
+version = "0.0.0"
+description = "The audit log of the Meltingplot printer computers"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+dependencies = ["cryptography"]
+
+[project.urls]
+Repository = "https://github.com/Meltingplot/mp-audit"
+
+[tool.ruff]
+line-length = 120
+# The service and the tool have no file extension.
+extend-include = ["overlay/usr/bin/mp-audit", "overlay/usr/lib/meltingplot/mp-audit/mp-auditd"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle
+    "F",      # pyflakes
+    "W",      # pycodestyle warnings
+    "I",      # import order
+    "B",      # likely bugs
+    "UP",     # outdated syntax
+    "BLE",    # blind except
+    "C4",     # comprehensions
+    "PIE",    # needless code
+    "S",      # security
+    "RUF100", # noqa comments that do nothing
+]
+ignore = [
+    "UP031", # % formatting is the house style; rewriting it in the code that writes the proof gains nothing
+    "S603",  # the service runs fixed system tools (blkid, mkfs.ext4, e2fsck, chattr) with fixed arguments
+    "S607",  # by name, found through PATH as the unit sets it
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["auditcore", "auditlog"]
+
+[tool.ruff.lint.per-file-ignores]
+# The tests run on a build host, on temporary directories, with their own stubs.
+"test/*" = ["S101", "S103", "S108"]

@@ -51,18 +51,18 @@ SHARES = {
 # rest arrives with the operating time, so that the share lasts five years.
 BURST_DIVISOR = 64
 
-FLUSH_INTERVAL = 5          # AL-51: attempts and operation, written every 5 s
-SAVE_INTERVAL = 60          # AL-51: counters at most once a minute
-OPTIME_INTERVAL = 600       # AL-51: operating time at most every 10 minutes
-EPOCH = 900                 # AL-55: 15 minutes of operating time
-EPOCH_SPENT = 3600          # with the reserve spent: one seal an hour
-WINDOWS = (60, 3600, DAY)   # AL-41: a summary waits a minute, an hour, a day
+FLUSH_INTERVAL = 5  # AL-51: attempts and operation, written every 5 s
+SAVE_INTERVAL = 60  # AL-51: counters at most once a minute
+OPTIME_INTERVAL = 600  # AL-51: operating time at most every 10 minutes
+EPOCH = 900  # AL-55: 15 minutes of operating time
+EPOCH_SPENT = 3600  # with the reserve spent: one seal an hour
+WINDOWS = (60, 3600, DAY)  # AL-41: a summary waits a minute, an hour, a day
 SEGMENT_MAX = 4 * MiB
-TOP = 10                    # AL-41: the ten most frequent sources and objects
-TRACK = 32                  # counted to find them (space-saving)
+TOP = 10  # AL-41: the ten most frequent sources and objects
+TRACK = 32  # counted to find them (space-saving)
 TOP_LEN = 40
-PENDING_MAX = 10000         # entries held while the partition cannot be written
-SEAL_COST = 300             # bytes of a seal, charged to whoever caused it
+PENDING_MAX = 10000  # entries held while the partition cannot be written
+SEAL_COST = 300  # bytes of a seal, charged to whoever caused it
 
 
 class Clock:
@@ -92,8 +92,9 @@ def clock_synced():
     adjtimex answers TIME_ERROR (5) while it is not."""
     try:
         import ctypes
+
         libc = ctypes.CDLL(None, use_errno=True)
-        buf = ctypes.create_string_buffer(512)     # struct timex, modes = 0
+        buf = ctypes.create_string_buffer(512)  # struct timex, modes = 0
         return libc.adjtimex(buf) not in (-1, 5)
     except (OSError, AttributeError):
         return False
@@ -182,11 +183,20 @@ class Summary:
         src, src_other = self._top(self.src, self.n)
         obj, obj_other = self._top(self.obj, self.n)
         return {
-            "n": self.n, "from": self.first, "to": self.last,
-            "t0": self.t0, "t1": self.t1, "op0": self.op0, "op1": self.op1,
+            "n": self.n,
+            "from": self.first,
+            "to": self.last,
+            "t0": self.t0,
+            "t1": self.t1,
+            "op0": self.op0,
+            "op1": self.op1,
             "window": WINDOWS[self.window],
-            "src": src, "src_other": src_other, "obj": obj, "obj_other": obj_other,
-            "digest": self.digest, "last": self.last_event,
+            "src": src,
+            "src_other": src_other,
+            "obj": obj,
+            "obj_other": obj_other,
+            "digest": self.digest,
+            "last": self.last_event,
         }
 
     def to_json(self):
@@ -203,8 +213,7 @@ class AuditCore:
     """The log of this computer. Thread safe: every public method takes the
     lock, so the socket threads of the service can record concurrently."""
 
-    def __init__(self, root, ident, clock=None, journal=None, shares=None,
-                 append_only=True):
+    def __init__(self, root, ident, clock=None, journal=None, shares=None, append_only=True):
         self.root = root
         self.own = os.path.join(root, "own")
         self.logdir = os.path.join(self.own, "log")
@@ -235,7 +244,7 @@ class AuditCore:
         self.key = None
         self.unsealed = 0
         self.last_ev = {}
-        self.used = {c: 0 for c in self.shares}
+        self.used = dict.fromkeys(self.shares, 0)
         self.buckets = {c: Bucket(s) for c, s in self.shares.items()}
         self.summaries = {}
         self.pending = []
@@ -285,8 +294,7 @@ class AuditCore:
         if not self.append_only:
             return
         try:
-            subprocess.run(["chattr", flag, path], check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["chattr", flag, path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except (OSError, subprocess.CalledProcessError):
             self.notes.append(("chattr", "cannot set %s on %s" % (flag, path)))
 
@@ -327,7 +335,7 @@ class AuditCore:
         self._append(data)
         self.need_newline = False
         self.prev = prev
-        for obj, line in zip(objs, lines):
+        for obj, line in zip(objs, lines, strict=True):
             self._account(obj, len(line) + 1)
         return lines
 
@@ -421,8 +429,17 @@ class AuditCore:
         key = al.new_key()
         self._store_key(self.epoch + 1, key)
         old = self.epoch
-        self._write_lines([{"rekey": old, "op": int(self.op()), "boot": self.boot,
-                            "t": self.clock.utc(), "next": al.public_text(key)}])
+        self._write_lines(
+            [
+                {
+                    "rekey": old,
+                    "op": int(self.op()),
+                    "boot": self.boot,
+                    "t": self.clock.utc(),
+                    "next": al.public_text(key),
+                }
+            ]
+        )
         self.key = key
         self.epoch_op = self.op()
         self._wipe_keys_except(self._keypath(self.epoch))
@@ -432,14 +449,26 @@ class AuditCore:
 
     def _state(self):
         return {
-            "format": al.FORMAT, "start": self.start, "seq": self.next_seq,
-            "acc": self.acc, "seg": self.seg, "off": self.off, "prev": self.prev,
-            "epoch": self.epoch, "pub": self.pub, "unsealed": self.unsealed,
-            "last_ev": self.last_ev, "used": self.used,
+            "format": al.FORMAT,
+            "start": self.start,
+            "seq": self.next_seq,
+            "acc": self.acc,
+            "seg": self.seg,
+            "off": self.off,
+            "prev": self.prev,
+            "epoch": self.epoch,
+            "pub": self.pub,
+            "unsealed": self.unsealed,
+            "last_ev": self.last_ev,
+            "used": self.used,
             "buckets": {c: [b.tokens, b.op] for c, b in self.buckets.items()},
             "summaries": {k: s.to_json() for k, s in self.summaries.items()},
-            "boot": self.boot, "bid": self.bid, "op_base": self.op_base,
-            "op": self.op(), "clean": False, "extra": self.extra,
+            "boot": self.boot,
+            "bid": self.bid,
+            "op_base": self.op_base,
+            "op": self.op(),
+            "clean": False,
+            "extra": self.extra,
             "saved": self.clock.utc(),
         }
 
@@ -542,9 +571,13 @@ class AuditCore:
             # anything else, so the check can step over it.
             if self.torn:
                 n, h = self.torn
-                self.record("E17", "info", force=True,
-                            msg="incomplete line at the end of the log, left by a crash",
-                            data={"torn": n, "torn_sha256": h})
+                self.record(
+                    "E17",
+                    "info",
+                    force=True,
+                    msg="incomplete line at the end of the log, left by a crash",
+                    data={"torn": n, "torn_sha256": h},
+                )
                 self.flush()
             if not self._load_key():
                 self._rekey()
@@ -615,12 +648,19 @@ class AuditCore:
     def _entry(self, ev, res, actor="", via="", obj="", msg="", data=None):
         idt = self.ident()
         e = {
-            "seq": self.next_seq, "boot": self.boot, "bid": self.bid,
-            "t": self.clock.utc(), "sync": bool(self.clock.synced()),
+            "seq": self.next_seq,
+            "boot": self.boot,
+            "bid": self.bid,
+            "t": self.clock.utc(),
+            "sync": bool(self.clock.synced()),
             "op": int(self.op()),
-            "sys": al.clean(idt.get("sys", ""), 16), "host": al.clean(idt.get("host", ""), 64),
-            "mach": al.clean(idt.get("mach", ""), 64), "img": al.clean(idt.get("img", ""), 64),
-            "ev": ev, "cls": al.class_of(ev, res) if res != al.AGGREGATED else None, "res": res,
+            "sys": al.clean(idt.get("sys", ""), 16),
+            "host": al.clean(idt.get("host", ""), 64),
+            "mach": al.clean(idt.get("mach", ""), 64),
+            "img": al.clean(idt.get("img", ""), 64),
+            "ev": ev,
+            "cls": al.class_of(ev, res) if res != al.AGGREGATED else None,
+            "res": res,
         }
         if actor:
             e["actor"] = al.clean(actor, 64)
@@ -659,8 +699,7 @@ class AuditCore:
             self.save_state()
             return self.start
 
-    def record(self, ev, res, actor="", via="", obj="", msg="", data=None,
-               sync=False, force=False):
+    def record(self, ev, res, actor="", via="", obj="", msg="", data=None, sync=False, force=False):
         """Accept one event. Returns its sequence number.
 
         Attempts and operation are written at the next flush, within five
@@ -721,9 +760,13 @@ class AuditCore:
             # One E19 per id and window (AL-43).
             # "from" lets a check of the log tell the numbers of a summary
             # that is still open from numbers that are missing.
-            self.record("E19", "info", obj=key,
-                        msg="%s over the budget of class %s, counted in a summary" % (ev, cls),
-                        data={"class": cls, "event": ev, "from": e["seq"]})
+            self.record(
+                "E19",
+                "info",
+                obj=key,
+                msg="%s over the budget of class %s, counted in a summary" % (ev, cls),
+                data={"class": cls, "event": ev, "from": e["seq"]},
+            )
 
     def _close_summaries(self, op, force=False):
         """Write the summaries that are due. With force all of them, whatever
@@ -746,7 +789,7 @@ class AuditCore:
                 self.buckets[s.cls].debit(cost, op)
             else:
                 s.window += 1
-                self.next_seq -= 1      # the number was not used
+                self.next_seq -= 1  # the number was not used
                 self.dirty = True
                 continue
             del self.summaries[key]
@@ -757,10 +800,11 @@ class AuditCore:
     def _drop_pending(self):
         """The partition cannot be written and entries pile up. Keep the
         first of them; the rest is lost, and counted as such (AL-11)."""
-        lost = self.pending[PENDING_MAX // 2:]
-        del self.pending[PENDING_MAX // 2:]
-        e = self._entry("E17", "failed", msg="audit log not writable, %d entries lost" % len(lost),
-                        data={"lost": len(lost)})
+        lost = self.pending[PENDING_MAX // 2 :]
+        del self.pending[PENDING_MAX // 2 :]
+        e = self._entry(
+            "E17", "failed", msg="audit log not writable, %d entries lost" % len(lost), data={"lost": len(lost)}
+        )
         self.pending.append(e)
         self.journal(e)
 
@@ -808,8 +852,13 @@ class AuditCore:
             n = self.epoch
             try:
                 self._store_key(n + 1, nxt)
-                seal = {"seal": n, "op": int(self.op()), "boot": self.boot,
-                        "t": self.clock.utc(), "next": al.public_text(nxt)}
+                seal = {
+                    "seal": n,
+                    "op": int(self.op()),
+                    "boot": self.boot,
+                    "t": self.clock.utc(),
+                    "next": al.public_text(nxt),
+                }
                 seal["prev"] = self.prev
                 seal["sig"] = al.sign(self.key, al.seal_payload(seal))
                 self._write_lines([seal])
@@ -837,8 +886,7 @@ class AuditCore:
             if self.unsealed and op - self.epoch_op >= (EPOCH_SPENT if spent else EPOCH):
                 self.buckets[RESERVE].debit(SEAL_COST, op)
                 self.seal()
-            if ((self.dirty and mono - self.last_save >= SAVE_INTERVAL)
-                    or op - self.op_saved >= OPTIME_INTERVAL):
+            if (self.dirty and mono - self.last_save >= SAVE_INTERVAL) or op - self.op_saved >= OPTIME_INTERVAL:
                 self.flush()
                 if self.healthy:
                     try:
@@ -866,8 +914,7 @@ class AuditCore:
         """The summaries not written yet, in the form verify() takes: which
         numbers they hold and how many."""
         with self.lock:
-            return [{"key": k, "from": s.first, "to": s.last, "n": s.n}
-                    for k, s in sorted(self.summaries.items())]
+            return [{"key": k, "from": s.first, "to": s.last, "n": s.n} for k, s in sorted(self.summaries.items())]
 
     def read_snapshot(self):
         """The log and the open summaries at the same moment, for a check
@@ -878,7 +925,7 @@ class AuditCore:
             return self.open_summaries(), self.snapshot()
 
     def lines(self, snap=None):
-        for path, size in (self.snapshot() if snap is None else snap):
+        for path, size in self.snapshot() if snap is None else snap:
             with open(path, "rb") as f:
                 data = f.read(size)
             for raw in data.split(b"\n"):
@@ -893,9 +940,14 @@ class AuditCore:
             return {
                 "start": self.start,
                 "fingerprint": al.fingerprint(self.start) if self.start else None,
-                "seq": self.next_seq - 1, "epoch": self.epoch, "boot": self.boot,
-                "op": int(op), "healthy": self.healthy, "fault": self.fault,
-                "pending": len(self.pending), "summaries": sorted(self.summaries),
+                "seq": self.next_seq - 1,
+                "epoch": self.epoch,
+                "boot": self.boot,
+                "op": int(op),
+                "healthy": self.healthy,
+                "fault": self.fault,
+                "pending": len(self.pending),
+                "summaries": sorted(self.summaries),
                 "used": dict(self.used),
                 "shares": dict(self.shares),
                 "budget": {c: int(b.tokens) for c, b in self.buckets.items()},

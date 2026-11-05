@@ -47,8 +47,8 @@ CLI = os.path.realpath(os.path.join(OVERLAY, "usr", "bin", "mp-audit"))
 DAEMON = os.path.join(LIB, "mp-auditd")
 sys.path.insert(0, LIB)
 
-import auditcore as ac   # noqa: E402
-import auditlog as al    # noqa: E402
+import auditcore as ac  # noqa: E402
+import auditlog as al  # noqa: E402
 
 failed = 0
 # fsync is cheap on a tmpfs; the flood test writes for thirty simulated days
@@ -132,6 +132,7 @@ def write_segment(core, lines):
 
 # --- chain and seals --------------------------------------------------------------
 
+
 def test_chain():
     d, clk, core = fresh()
     start = core.start
@@ -149,8 +150,11 @@ def test_chain():
     check("keys: only the open epoch's key on disk", ["epoch-%d.key" % core.epoch], keys)
     last_seal = [json.loads(x) for x in lines_of(core) if '"seal"' in x][-1]
     with open(os.path.join(d, "own", "keys", keys[0]), "rb") as f:
-        check("keys: it is the one the last seal announced", last_seal["next"],
-              al.public_text(al.key_from_bytes(f.read())))
+        check(
+            "keys: it is the one the last seal announced",
+            last_seal["next"],
+            al.public_text(al.key_from_bytes(f.read())),
+        )
     shutil.rmtree(d)
 
 
@@ -184,18 +188,16 @@ def test_tamper():
         out.append(line)
     rep = al.verify(out, start)
     check("tamper: changed entry in a sealed epoch found", "changed", rep.result)
-    check("tamper: named as a seal that does not verify", True,
-          any("not signed" in t for _, _, t in rep.problems))
+    check("tamper: named as a seal that does not verify", True, any("not signed" in t for _, _, t in rep.problems))
 
     # without recomputing: the chain breaks at the next line
     objs = [json.loads(x) for x in lines]
     objs[i]["msg"] = "nothing happened"
     rep = al.verify([al.canon(o) for o in objs], start)
-    check("tamper: plain edit breaks the chain", True,
-          any("does not chain" in t for _, _, t in rep.problems))
+    check("tamper: plain edit breaks the chain", True, any("does not chain" in t for _, _, t in rep.problems))
 
     # a line taken out
-    rep = al.verify(lines[:i] + lines[i + 1:], start)
+    rep = al.verify(lines[:i] + lines[i + 1 :], start)
     check("tamper: removed line found", "changed", rep.result)
 
     # a new log from scratch has another start hash
@@ -207,6 +209,7 @@ def test_tamper():
 
 
 # --- restarts, crashes, torn writes -------------------------------------------------
+
 
 def test_restart():
     d, clk, core = fresh()
@@ -304,6 +307,7 @@ def test_lost_key():
 
 # --- strings, writers, reset --------------------------------------------------------
 
+
 def test_strings():
     d, clk, core = fresh()
     core.record("E10", "refused", actor="1-1", obj="\x1b[2J" + "A" * 1000, msg="name\nwith\tcontrol\x07")
@@ -327,6 +331,7 @@ def test_parallel():
     def writer(n):
         for i in range(200):
             core.record("E13", "done", actor="t%d" % n, msg=str(i))
+
     ts = [threading.Thread(target=writer, args=(n,)) for n in range(8)]
     for t in ts:
         t.start()
@@ -364,18 +369,26 @@ def test_reset():
     arch = os.path.join(d, "archive", archived[0])
     with open(os.path.join(arch, "log", "00000001.jsonl")) as f:
         rep = al.verify(f.read().splitlines(), old)
-    check("reset: old log closed, its open summary written", ("valid", 0, True),
-          (rep.result, rep.pending, rep.aggregated > 0), rep.problems[:2])
+    check(
+        "reset: old log closed, its open summary written",
+        ("valid", 0, True),
+        (rep.result, rep.pending, rep.aggregated > 0),
+        rep.problems[:2],
+    )
     check("reset: no key of the old log left", [], os.listdir(os.path.join(arch, "keys")))
     e18 = [e for e in entries(core) if e["ev"] == "E18"]
     check("reset: E18 names the old log", old, e18[0]["data"]["old_start"] if e18 else None)
-    check("reset: E18 names who and why", ("mpadmin", "drive replaced in the lab"),
-          (e18[0].get("actor"), e18[0]["data"]["reason"]) if e18 else None)
+    check(
+        "reset: E18 names who and why",
+        ("mpadmin", "drive replaced in the lab"),
+        (e18[0].get("actor"), e18[0]["data"]["reason"]) if e18 else None,
+    )
     check("reset: new log valid", "valid", al.verify(lines_of(core), new).result)
     shutil.rmtree(d)
 
 
 # --- floods and budgets -------------------------------------------------------------
+
 
 def test_open_summary():
     """A check while a summary is still open (after a flood it waits up to a
@@ -397,8 +410,12 @@ def test_open_summary():
     check("open: every number counted", core.next_seq - 1, rep.last_seq)
     check("open: the open summary holds the rest", core.summaries["attempt/E12"].n, rep.pending)
     rep = al.verify(lines, start)
-    check("open: from files pending, announced by E19", ("pending", ["attempt/E12"]),
-          (rep.result, rep.pending_keys), rep.problems[:2])
+    check(
+        "open: from files pending, announced by E19",
+        ("pending", ["attempt/E12"]),
+        (rep.result, rep.pending_keys),
+        rep.problems[:2],
+    )
     bad = [dict(o, n=o["n"] - 1) for o in opened]
     check("open: a summary short of a number is found", "changed", al.verify(lines, start, bad).result)
     check("open: a gap the service does not explain is found", "changed", al.verify(lines, start, []).result)
@@ -413,8 +430,7 @@ def test_open_summary():
     c2.record("E13", "done", actor="mpadmin", msg="after the flood")
     opened2, snap2 = c2.read_snapshot()
     rep = al.verify(list(c2.lines(snap2)), c2.start)
-    check("open: from files, a gap before the open summary is found", "changed", rep.result,
-          rep.problems[:1])
+    check("open: from files, a gap before the open summary is found", "changed", rep.result, rep.problems[:1])
     shutil.rmtree(d2)
     # a restart keeps it open, and the check still holds
     core.close()
@@ -428,18 +444,32 @@ def test_open_summary():
         c2.tick()
     c2.close()
     rep = al.verify(lines_of(c2), start, c2.open_summaries())
-    check("open: once written, nothing pending", ("valid", 0, [], True),
-          (rep.result, rep.pending, c2.open_summaries(), rep.aggregated >= sent - 3000), rep.aggregated)
+    check(
+        "open: once written, nothing pending",
+        ("valid", 0, [], True),
+        (rep.result, rep.pending, c2.open_summaries(), rep.aggregated >= sent - 3000),
+        rep.aggregated,
+    )
     shutil.rmtree(d)
 
 
 def summary_max():
     s = ac.Summary(al.ATTEMPT, "E10", 0)
     for i in range(1000):
-        s.add({"seq": 10 ** 9 + i, "t": "2026-11-04T12:00:00Z", "op": 10 ** 9, "res": "refused",
-               "actor": "x" * 64 + str(i), "via": "y" * 32, "obj": "z" * 256 + str(i), "msg": "m" * 256})
+        s.add(
+            {
+                "seq": 10**9 + i,
+                "t": "2026-11-04T12:00:00Z",
+                "op": 10**9,
+                "res": "refused",
+                "actor": "x" * 64 + str(i),
+                "via": "y" * 32,
+                "obj": "z" * 256 + str(i),
+                "msg": "m" * 256,
+            }
+        )
     d, clk, core = fresh()
-    e = core._entry("E10", al.AGGREGATED, msg="%d events counted" % (10 ** 9))
+    e = core._entry("E10", al.AGGREGATED, msg="%d events counted" % (10**9))
     e["cls"] = al.ATTEMPT
     e["agg"] = s.agg()
     size = core._cost(e)
@@ -456,13 +486,21 @@ def test_budget_design():
     for cls in al.CLASSES:
         if cls == al.STATE:
             continue
-        ids = [ev for ev in al.EVENTS if al.EVENTS[ev][0] == cls
-               or (cls == al.ATTEMPT and ev in al.ATTEMPT_WHEN_REFUSED)
-               or (cls == al.OPERATION and ev == "E03")]
+        ids = [
+            ev
+            for ev in al.EVENTS
+            if al.EVENTS[ev][0] == cls
+            or (cls == al.ATTEMPT and ev in al.ATTEMPT_WHEN_REFUSED)
+            or (cls == al.OPERATION and ev == "E03")
+        ]
         b = ac.Bucket(ac.SHARES[cls])
         daily = b.rate * ac.DAY
-        check("budget: %-9s earns a day's summaries (%d ids)" % (cls, len(ids)), True,
-              daily >= len(ids) * smax, "earns %d B a day, needs %d" % (daily, len(ids) * smax))
+        check(
+            "budget: %-9s earns a day's summaries (%d ids)" % (cls, len(ids)),
+            True,
+            daily >= len(ids) * smax,
+            "earns %d B a day, needs %d" % (daily, len(ids) * smax),
+        )
 
 
 def test_flood():
@@ -483,8 +521,9 @@ def test_flood():
     step = 20
     for i in range(days * 86400 // step):
         n += 1
-        core.record("E10", "refused", actor="1-%d" % (n % 7), obj="%04x:%04x" % (n % 65536, n % 9973),
-                    msg="device %d" % n)
+        core.record(
+            "E10", "refused", actor="1-%d" % (n % 7), obj="%04x:%04x" % (n % 65536, n % 9973), msg="device %d" % n
+        )
         core.record("E12", "refused", actor="user%d" % n, obj="10.0.%d.%d" % (n % 250, n % 13))
         core.record("E11", "info", obj="stick%d" % n)
         clk.advance(step)
@@ -509,8 +548,12 @@ def test_flood():
     for cls in (al.ATTEMPT, al.OPERATION):
         b = ac.Bucket(ac.SHARES[cls])
         allowance = b.cap + b.rate * op + 2 * summary_max()
-        check("flood: %-9s within its budget" % cls, True, core.used[cls] <= allowance,
-              "used %d B, allowed %d" % (core.used[cls], allowance))
+        check(
+            "flood: %-9s within its budget" % cls,
+            True,
+            core.used[cls] <= allowance,
+            "used %d B, allowed %d" % (core.used[cls], allowance),
+        )
     first = {}
     for e in es:
         first.setdefault(e["ev"], e)
@@ -552,8 +595,12 @@ def test_wear():
     syncs = core.stats["fsyncs"] - f0
     cap = ac.Bucket(ac.SHARES[al.ATTEMPT]).cap
     check("wear: bytes within the burst of the class", True, written <= cap + 64 * 1024, "%d B" % written)
-    check("wear: at most one flush per 5 s, state once a minute", True, syncs <= 3600 // 5 + 3 * 60 + 20,
-          "%d fsyncs" % syncs)
+    check(
+        "wear: at most one flush per 5 s, state once a minute",
+        True,
+        syncs <= 3600 // 5 + 3 * 60 + 20,
+        "%d fsyncs" % syncs,
+    )
     shutil.rmtree(d)
 
 
@@ -565,8 +612,7 @@ def test_clock():
     clk.realtime += 6 * 365 * 86400
     core.tick()
     core.buckets[al.ATTEMPT].refill(core.op())
-    check("clock: a clock six years ahead adds no budget", True,
-          core.buckets[al.ATTEMPT].tokens - before < 1)
+    check("clock: a clock six years ahead adds no budget", True, core.buckets[al.ATTEMPT].tokens - before < 1)
     shutil.rmtree(d)
 
 
@@ -574,9 +620,11 @@ def test_clock():
 
 # --- the image and its trial boot (E02) ----------------------------------------------
 
+
 def load_daemon():
     import importlib.machinery
     import importlib.util
+
     loader = importlib.machinery.SourceFileLoader("mp_auditd", DAEMON)
     spec = importlib.util.spec_from_loader("mp_auditd", loader)
     mod = importlib.util.module_from_spec(spec)
@@ -621,8 +669,11 @@ def test_trial():
     check("trial: ... started as a trial", True, core.extra.get("trial", {}).get("tryboot"))
     pc.done = True
     svc.watch_trial()
-    check("trial: and the commit", ("done", "image 0.1.0-rc.12 committed after its trial boot"),
-          e02(core)[-1] if e02(core) else None)
+    check(
+        "trial: and the commit",
+        ("done", "image 0.1.0-rc.12 committed after its trial boot"),
+        e02(core)[-1] if e02(core) else None,
+    )
     shutil.rmtree(d)
 
     # Committed in the last minute of the trial boot, before the service saw it.
@@ -631,8 +682,11 @@ def test_trial():
     clk.reboot(2)
     svc = service(core, FakePC("0.1.0-rc.12", "system_b", committed=True))
     svc.boot_events()
-    check("trial: a commit seen only at the next start", ("done", "image 0.1.0-rc.12 committed after its trial boot"),
-          e02(core)[-1] if e02(core) else None)
+    check(
+        "trial: a commit seen only at the next start",
+        ("done", "image 0.1.0-rc.12 committed after its trial boot"),
+        e02(core)[-1] if e02(core) else None,
+    )
     check("trial: ... is not a new image", 2, len(e02(core)))
     shutil.rmtree(d)
 
@@ -643,11 +697,16 @@ def test_trial():
     svc = service(core, FakePC("0.1.0-rc.13", "system_a", tried=True))
     svc.boot_events()
     got = e02(core)
-    check("trial: a trial that did not stay, when the log comes back", ("failed",
-          "trial boot of 0.1.0-rc.12 in system_b was not committed, now 0.1.0-rc.13 in system_a"),
-          got[1] if len(got) > 1 else None)
-    check("trial: ... then the new image", ("done", "image 0.1.0-rc.13 started in system_a"),
-          got[2] if len(got) > 2 else None)
+    check(
+        "trial: a trial that did not stay, when the log comes back",
+        ("failed", "trial boot of 0.1.0-rc.12 in system_b was not committed, now 0.1.0-rc.13 in system_a"),
+        got[1] if len(got) > 1 else None,
+    )
+    check(
+        "trial: ... then the new image",
+        ("done", "image 0.1.0-rc.13 started in system_a"),
+        got[2] if len(got) > 2 else None,
+    )
     shutil.rmtree(d)
 
     # Rolled back to the image before, which has the log (as before the fix).
@@ -658,20 +717,32 @@ def test_trial():
     svc.boot_events()
     clk.reboot(2)
     service(core, FakePC("0.1.0-rc.12", "system_b")).boot_events()
-    check("trial: back on the image before", [("failed",
-          "trial boot of 0.1.0-rc.13 in system_a was not committed, now 0.1.0-rc.12 in system_b"),
-          ("done", "image 0.1.0-rc.12 started in system_b")], e02(core)[-2:])
+    check(
+        "trial: back on the image before",
+        [
+            ("failed", "trial boot of 0.1.0-rc.13 in system_a was not committed, now 0.1.0-rc.12 in system_b"),
+            ("done", "image 0.1.0-rc.12 started in system_b"),
+        ],
+        e02(core)[-2:],
+    )
     shutil.rmtree(d)
 
 
 def cli(env, *args):
-    p = subprocess.run([sys.executable, "-I", "-B", CLI] + list(args), env=env,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+    p = subprocess.run(
+        [sys.executable, "-I", "-B", CLI] + list(args),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
     return p.returncode, p.stdout, p.stderr
 
 
 def test_service():
-    tmp = mkdtemp()
+    # Not on SCRATCH: the stubs below have to run, and a container mounts
+    # /dev/shm noexec. This test does not write enough for fsync to matter.
+    tmp = tempfile.mkdtemp()
     run = os.path.join(tmp, "run")
     store = os.path.join(tmp, "store")
     os.makedirs(store)
@@ -696,17 +767,24 @@ def test_service():
     journal = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     journal.bind(jsock)
     journal.settimeout(0.2)
-    env = dict(os.environ, MP_AUDIT_RUN=run, MP_AUDIT_STORE=store,
-               MP_DEVICE_CONF=os.path.join(tmp, "device.conf"),
-               MP_IDENTITY_FILE=os.path.join(tmp, "identity"),
-               MP_AUDIT_INSTALLER=os.path.join(tmp, "installer.txt"),
-               MP_AUDIT_JOURNAL=jsock, MP_AUDIT_JOURNALCTL=stub, MP_AUDIT_SYSTEMCTL=systemctl,
-               MP_AUDIT_SOCKET=os.path.join(run, "socket"))
+    env = dict(
+        os.environ,
+        MP_AUDIT_RUN=run,
+        MP_AUDIT_STORE=store,
+        MP_DEVICE_CONF=os.path.join(tmp, "device.conf"),
+        MP_IDENTITY_FILE=os.path.join(tmp, "identity"),
+        MP_AUDIT_INSTALLER=os.path.join(tmp, "installer.txt"),
+        MP_AUDIT_JOURNAL=jsock,
+        MP_AUDIT_JOURNALCTL=stub,
+        MP_AUDIT_SYSTEMCTL=systemctl,
+        MP_AUDIT_SOCKET=os.path.join(run, "socket"),
+    )
     env.pop("NOTIFY_SOCKET", None)
 
     def start():
-        p = subprocess.Popen([sys.executable, "-I", "-B", DAEMON], env=env,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        p = subprocess.Popen(
+            [sys.executable, "-I", "-B", DAEMON], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
         for _ in range(100):
             if cli(env, "status")[0] in (0, 2):
                 break
@@ -722,8 +800,9 @@ def test_service():
     evs = [json.loads(x)["ev"] for x in out.splitlines()]
     check("service: begins with E01, then the installation (E18)", ["E01", "E18"], evs[:2])
     e18 = json.loads(out.splitlines()[1])
-    check("service: E18 says what the card found", "installation over layout gen2, no earlier audit log",
-          e18.get("msg"))
+    check(
+        "service: E18 says what the card found", "installation over layout gen2, no earlier audit log", e18.get("msg")
+    )
     check("service: machine from the identity", "chx-350-001", e18.get("mach"))
     check("service: the first start records the image (E02)", "E02", evs[2] if len(evs) > 2 else None)
     rc, _, err = cli(dict(env, MP_AUDIT_UID="1000"), "record", "E10", "refused", "--actor", "1-1")
@@ -745,8 +824,11 @@ def test_service():
     got = msgs()
     again = [m for e, m in got if e == "E17" and m.startswith("the audit service started again within this boot")]
     check("service: a stop while the system runs is an E17", 1, got.count(stopped), [e for e, _ in got])
-    check("service: the start after it in the same boot too, no E15", (1, False),
-          (len(again), any(e == "E15" for e, _ in got)))
+    check(
+        "service: the start after it in the same boot too, no E15",
+        (1, False),
+        (len(again), any(e == "E15" for e, _ in got)),
+    )
     with open(sysstate, "w") as f:
         f.write("stopping\n")
     p.send_signal(signal.SIGTERM)
@@ -759,8 +841,12 @@ def test_service():
     p.wait()
     p = start()
     got = msgs()
-    check("service: a killed service is an E17 at the next start", True,
-          ("E17", "the audit service was restarted without a clean stop") in got, [e for e, _ in got])
+    check(
+        "service: a killed service is an E17 at the next start",
+        True,
+        ("E17", "the audit service was restarted without a clean stop") in got,
+        [e for e, _ in got],
+    )
     rc, out, _ = cli(env, "verify", "--start", st.get("start", ""))
     check("service: still valid after the kill", 0, rc)
     p.send_signal(signal.SIGTERM)
@@ -770,15 +856,16 @@ def test_service():
     while True:
         try:
             journal.recv(65536)
-        except socket.timeout:
+        except TimeoutError:
             break
     nowhere = dict(env, MP_AUDIT_SOCKET=os.path.join(tmp, "nowhere"))
-    rc, _, err = cli(dict(nowhere, MP_AUDIT_UID="0"), "record", "E10", "refused",
-                     "--actor", "1-1", "--obj", "046a:0011")
+    rc, _, err = cli(
+        dict(nowhere, MP_AUDIT_UID="0"), "record", "E10", "refused", "--actor", "1-1", "--obj", "046a:0011"
+    )
     got = b""
     try:
         got = journal.recv(65536)
-    except socket.timeout:
+    except TimeoutError:
         pass
     check("record: without the service it queues in the journal", (0, True), (rc, b"MP_AUDIT_PENDING=1" in got))
     # Decision 23: without root nothing goes into the journal; the service
@@ -787,18 +874,37 @@ def test_service():
     got = b""
     try:
         got = journal.recv(65536)
-    except socket.timeout:
+    except TimeoutError:
         pass
-    check("record: without root it refuses and queues nothing", (2, False), (rc, b"MP_AUDIT_PENDING=1" in got),
-          err.strip())
+    check(
+        "record: without root it refuses and queues nothing",
+        (2, False),
+        (rc, b"MP_AUDIT_PENDING=1" in got),
+        err.strip(),
+    )
     journal.close()
     shutil.rmtree(tmp)
 
 
 def main():
-    for t in (test_chain, test_tamper, test_restart, test_crash, test_lost_key, test_strings,
-              test_parallel, test_reset, test_open_summary, test_budget_design, test_flood, test_change_at_once,
-              test_wear, test_clock, test_trial, test_service):
+    for t in (
+        test_chain,
+        test_tamper,
+        test_restart,
+        test_crash,
+        test_lost_key,
+        test_strings,
+        test_parallel,
+        test_reset,
+        test_open_summary,
+        test_budget_design,
+        test_flood,
+        test_change_at_once,
+        test_wear,
+        test_clock,
+        test_trial,
+        test_service,
+    ):
         t()
     sys.exit(failed)
 

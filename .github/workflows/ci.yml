@@ -1,0 +1,84 @@
+name: ci
+
+# Style, lint and tests for every change. The image repository also runs the
+# tests, but only once a commit is pinned there; this finds a problem first.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here publishes anything, so no job may write. Actions are pinned to a
+# commit, with the version beside it for Dependabot.
+permissions: {}
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+      - name: Install the tools
+        run: pip install -r requirements-dev.txt
+      # The same hooks as on a developer's machine: ruff format, ruff check and
+      # shellcheck. A file the formatter would change fails the job.
+      - name: Style and lint
+        run: pre-commit run --all-files --show-diff-on-failure
+      # The tests start the service without its unit, so nothing else reads it.
+      - name: Check the unit
+        run: systemd-analyze verify --root=overlay --man=no overlay/usr/lib/systemd/system/mp-audit.service
+
+  # What runs on a device: arm64, Debian trixie, its Python and its
+  # python3-cryptography. Run with dash, as the image repository's CI does.
+  test-device:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    container: debian:trixie
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install what the tests need
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 python3-cryptography
+      - name: Tests
+        run: dash test/test-mp-audit.sh
+
+  # The check of a log off the device has to work on any computer (AL-61):
+  # the oldest Python auditlog.py promises, and a current one.
+  test-off-device:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.14']
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install what the tests need
+        run: pip install -r requirements-dev.txt
+      - name: Tests
+        run: sh test/test-mp-audit.sh
