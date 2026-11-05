@@ -64,6 +64,7 @@ TRACK = 32  # counted to find them (space-saving)
 TOP_LEN = 40
 PENDING_MAX = 10000  # entries held while the partition cannot be written
 SEAL_COST = 300  # bytes of a seal, charged to whoever caused it
+FIELD_LIMITS = {"actor": 64, "via": 32, "obj": 256, "msg": 256}  # of an entry, bounded (AL-02)
 
 
 class Clock:
@@ -212,7 +213,7 @@ class AuditCore:
     """The log of this computer. Thread safe: every public method takes the
     lock, so the socket threads of the service can record concurrently."""
 
-    def __init__(self, root, ident, clock=None, journal=None, shares=None, append_only=True):
+    def __init__(self, root, ident, clock=None, journal=None, append_only=True):
         self.root = root
         self.own = os.path.join(root, "own")
         self.logdir = os.path.join(self.own, "log")
@@ -221,7 +222,7 @@ class AuditCore:
         self.ident = ident
         self.clock = clock or Clock()
         self.journal = journal or (lambda e, note=None: None)
-        self.shares = dict(shares or SHARES)
+        self.shares = dict(SHARES)
         self.append_only = append_only
         self.lock = threading.RLock()
         self.stats = {"bytes": 0, "fsyncs": 0, "flushes": 0}
@@ -526,61 +527,70 @@ class AuditCore:
                 self.extra = (st or {}).get("extra", {})
                 self.seg = 1
                 return "new"
-
-            known = st and st.get("seg") in segs and st.get("off", 0) <= os.path.getsize(self._segpath(st["seg"]))
-            if known:
-                self.start = st["start"]
-                self.next_seq = st["seq"]
-                self.acc = st["acc"]
-                self.seg, self.off = st["seg"], st["off"]
-                self.prev = st["prev"]
-                self.epoch, self.pub = st["epoch"], st["pub"]
-                self.unsealed = st["unsealed"]
-                self.last_ev = st["last_ev"]
-                self.used.update(st["used"])
-                for c, (tokens, op) in st["buckets"].items():
-                    if c in self.buckets:
-                        self.buckets[c].tokens, self.buckets[c].op = tokens, op
-                self.summaries = {k: Summary.from_json(v) for k, v in st["summaries"].items()}
-                self.extra = st.get("extra", {})
-            else:
-                if st:
-                    # A log shorter than the state remembers was cut off
-                    # from outside; worth an entry either way.
-                    self.notes.append(("state", "state file does not match the log, log read in full"))
-                    self.extra = st.get("extra", {})
-                else:
-                    self.notes.append(("state", "state file missing, log read in full"))
-                self.seg, self.off = segs[0], 0
+            self._restore(st, segs)
             self._scan(segs)
-
             self._boots(st)
             self.epoch_op = self.op()
-
-            seen = []
-            if not self.prev_clean and self.prev_bid and recover:
-                seen = recover(self.prev_bid, self.next_seq)
-            known = max([self.next_seq - 1] + [seq for seq, _ in seen])
-            counted = self.acc + sum(s.n for s in self.summaries.values())
-            self.lost = max(0, known - counted)
-            self.recovered = seen
-            self.next_seq = known + 1
-
-            # Right after the unreadable rest of a crashed write, before
-            # anything else, so the check can step over it.
-            if self.torn:
-                n, h = self.torn
-                self.record(
-                    "E17",
-                    "info",
-                    force=True,
-                    msg="incomplete line at the end of the log, left by a crash",
-                    data={"torn": n, "torn_sha256": h},
-                )
-                self.flush()
+            self._count_lost(recover)
+            self._step_over_torn()
             if not self._load_key():
                 self._rekey()
             return "open"
+
+    def _restore(self, st, segs):
+        """Start from the state file if it fits the log, else from the log."""
+        if st and st.get("seg") in segs and st.get("off", 0) <= os.path.getsize(self._segpath(st["seg"])):
+            self._load_counters(st)
+            return
+        if st:
+            # A log shorter than the state remembers was cut off
+            # from outside; worth an entry either way.
+            self.notes.append(("state", "state file does not match the log, log read in full"))
+            self.extra = st.get("extra", {})
+        else:
+            self.notes.append(("state", "state file missing, log read in full"))
+        self.seg, self.off = segs[0], 0
+
+    def _load_counters(self, st):
+        self.start = st["start"]
+        self.next_seq = st["seq"]
+        self.acc = st["acc"]
+        self.seg, self.off = st["seg"], st["off"]
+        self.prev = st["prev"]
+        self.epoch, self.pub = st["epoch"], st["pub"]
+        self.unsealed = st["unsealed"]
+        self.last_ev = st["last_ev"]
+        self.used.update(st["used"])
+        for c, (tokens, op) in st["buckets"].items():
+            if c in self.buckets:
+                self.buckets[c].tokens, self.buckets[c].op = tokens, op
+        self.summaries = {k: Summary.from_json(v) for k, v in st["summaries"].items()}
+        self.extra = st.get("extra", {})
+
+    def _count_lost(self, recover):
+        """The numbers a crash left unaccounted, and what the journal still has of them."""
+        seen = []
+        if not self.prev_clean and self.prev_bid and recover:
+            seen = recover(self.prev_bid, self.next_seq)
+        known = max([self.next_seq - 1] + [seq for seq, _ in seen])
+        counted = self.acc + sum(s.n for s in self.summaries.values())
+        self.lost = max(0, known - counted)
+        self.recovered = seen
+        self.next_seq = known + 1
+
+    def _step_over_torn(self):
+        """Right after the unreadable rest of a crashed write, before
+        anything else, so the check can step over it."""
+        if self.torn:
+            n, h = self.torn
+            self.record(
+                "E17",
+                "info",
+                force=True,
+                msg="incomplete line at the end of the log, left by a crash",
+                data={"torn": n, "torn_sha256": h},
+            )
+            self.flush()
 
     def _boots(self, st):
         """Boot counter and operating time (AL-49). A new boot starts from
@@ -603,48 +613,57 @@ class AuditCore:
         """Read the lines after the known position into the counters."""
         self.torn = None
         for s in segs:
-            if s < self.seg:
-                continue
-            path = self._segpath(s)
-            with open(path, "rb") as f:
-                f.seek(self.off if s == self.seg else 0)
-                data = f.read()
-            if s != self.seg:
-                self.seg, self.off = s, 0
-            pos = 0
-            while pos < len(data):
-                end = data.find(b"\n", pos)
-                complete = end >= 0
-                raw = data[pos:end] if complete else data[pos:]
-                text = raw.decode("utf-8", "surrogateescape")
-                try:
-                    obj = json.loads(text) if raw.strip(b"\0") else None
-                    if not isinstance(obj, dict):
-                        raise ValueError
-                except ValueError:
-                    obj = None
-                if obj is None or not complete:
-                    if raw:
-                        # Only a crash in the middle of a write leaves this,
-                        # and only at the end. Not chained into anything.
-                        self.torn = (len(raw), al.line_hash(text))
-                        self.need_newline = not complete
-                    pos = (end + 1) if complete else len(data)
-                    self.off += len(raw) + (1 if complete else 0)
-                    continue
-                self.torn = None
-                if self.start is None:
-                    self.start = al.line_hash(text)
-                self._account(obj, len(raw) + 1, debit=True)
-                self.prev = al.line_hash(text)
-                pos = end + 1
-                self.off += len(raw) + 1
+            if s >= self.seg:
+                self._scan_segment(s)
         if self.torn is None:
             self.need_newline = False
 
+    def _scan_segment(self, s):
+        with open(self._segpath(s), "rb") as f:
+            f.seek(self.off if s == self.seg else 0)
+            data = f.read()
+        if s != self.seg:
+            self.seg, self.off = s, 0
+        pos = 0
+        while pos < len(data):
+            end = data.find(b"\n", pos)
+            complete = end >= 0
+            self._scan_line(data[pos:end] if complete else data[pos:], complete)
+            pos = (end + 1) if complete else len(data)
+
+    def _scan_line(self, raw, complete):
+        text = raw.decode("utf-8", "surrogateescape")
+        obj = self._parse_line(raw, text)
+        if obj is None or not complete:
+            if raw:
+                # Only a crash in the middle of a write leaves this,
+                # and only at the end. Not chained into anything.
+                self.torn = (len(raw), al.line_hash(text))
+                self.need_newline = not complete
+            self.off += len(raw) + (1 if complete else 0)
+            return
+        self.torn = None
+        if self.start is None:
+            self.start = al.line_hash(text)
+        self._account(obj, len(raw) + 1, debit=True)
+        self.prev = al.line_hash(text)
+        self.off += len(raw) + 1
+
+    @staticmethod
+    def _parse_line(raw, text):
+        try:
+            obj = json.loads(text) if raw.strip(b"\0") else None
+        except ValueError:
+            return None
+        return obj if isinstance(obj, dict) else None
+
     # --- entries ---------------------------------------------------------------
 
-    def _entry(self, ev, res, actor="", via="", obj="", msg="", data=None):
+    def _entry(self, ev, res, data=None, **fields):
+        """A new entry, with its number. fields are those of FIELD_LIMITS."""
+        unknown = fields.keys() - FIELD_LIMITS.keys()
+        if unknown:
+            raise TypeError(f"unknown fields {sorted(unknown)}")
         idt = self.ident()
         e = {
             "seq": self.next_seq,
@@ -661,14 +680,9 @@ class AuditCore:
             "cls": al.class_of(ev, res) if res != al.AGGREGATED else None,
             "res": res,
         }
-        if actor:
-            e["actor"] = al.clean(actor, 64)
-        if via:
-            e["via"] = al.clean(via, 32)
-        if obj:
-            e["obj"] = al.clean(obj, 256)
-        if msg:
-            e["msg"] = al.clean(msg, 256)
+        for name, limit in FIELD_LIMITS.items():
+            if fields.get(name):
+                e[name] = al.clean(fields[name], limit)
         if data:
             e["data"] = al.clean_data(data)
         self.next_seq += 1
@@ -698,8 +712,9 @@ class AuditCore:
             self.save_state()
             return self.start
 
-    def record(self, ev, res, actor="", via="", obj="", msg="", data=None, sync=False, force=False):
-        """Accept one event. Returns its sequence number.
+    def record(self, ev, res, *, sync=False, force=False, **fields):
+        """Accept one event. Returns its sequence number. fields are data and
+        those of FIELD_LIMITS.
 
         Attempts and operation are written at the next flush, within five
         seconds (AL-51). Changes are written before this returns, so a power
@@ -713,7 +728,7 @@ class AuditCore:
         if res not in al.RESULTS:
             raise ValueError(f"unknown result {res!r}")
         with self.lock:
-            e = self._entry(ev, res, actor, via, obj, msg, data)
+            e = self._entry(ev, res, **fields)
             cls = e["cls"]
             op = self.op()
             key = cls + "/" + ev
