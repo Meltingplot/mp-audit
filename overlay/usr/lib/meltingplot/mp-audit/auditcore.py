@@ -38,9 +38,10 @@ DAY = 86400
 FIVE_YEARS = int(5 * 365.25 * DAY)
 
 RESERVE = "reserve"
-# Shares of the computer's own log (AL-40): 256 MiB of the 512 MiB partition;
-# the other half is for the copy of the partner's log (AL-29). The reserve
-# pays for the seals of the regular epochs (AL-61).
+# Shares of the computer's own log (AL-40): 256 MiB, and as much again for the
+# copy of the partner's log (AL-29). The partition is larger, to leave room for
+# the filesystem (decision 26). The reserve pays for the seals of the regular
+# epochs (AL-61).
 SHARES = {
     al.STATE: 32 * MiB,
     al.CHANGE: 96 * MiB,

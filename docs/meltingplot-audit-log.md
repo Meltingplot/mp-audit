@@ -35,6 +35,7 @@ Am 2026-11-04 hat am Labor-HMI die USB-Freigaberegel (`mp-hmi-usb-guard`, noch S
 23. `mp-audit record` ohne root bricht mit „only root records“ und Exit 2 ab und gibt nichts ins Journal (Tim, 2026-11-05). Ins Journal stellt nur root, und nur wenn der Dienst nicht läuft (AL-35).
 24. Dienst, Werkzeug, ihre Tests und der Phasenplan liegen im eigenen Repository [Meltingplot/mp-audit](https://github.com/Meltingplot/mp-audit), das Meltingplot/rpi-image-gen als Submodul `meltingplot/mp-audit` pinnt (Tim, 2026-11-05). Der Layer `mp-audit` und seine Build-Prüfung bleiben im Image-Repository.
 25. Auch die Anforderungen liegen in Meltingplot/mp-audit. Eine Änderung an ihnen geht mit Code und Tests in einem PR. Unter dem alten Pfad in Meltingplot/rpi-image-gen bleibt ein kurzer Verweis (Tim, 2026-11-05).
+26. Das eigene Log bleibt bei 256 MiB, die Kopie des Partners ebenso. Die Partition ist größer, damit das Dateisystem Platz hat; die Anteile nach AL-40 ändern sich dadurch nicht (Tim, 2026-11-06).
 
 ## Grundlagen
 
@@ -145,7 +146,7 @@ Zu E05: Was das Image unter `0:/sys` mitbringt, schreibt der Boot jedes Mal übe
   - Der Ort steht in der Betriebsanleitung (T37).
 - **AL-05** Jeder Eintrag bleibt mindestens fünf Jahre erhalten (T39). Gemessen wird in Betriebszeit (AL-49), also mindestens fünf Kalenderjahre. Jüngere Einträge verschwinden nur über das Verfahren aus AL-17.
 - **AL-06** Für jede Ereignis-ID bleibt der letzte Eintrag dauerhaft erhalten, auch wenn er älter als fünf Jahre ist (T38).
-- **AL-07** Die Partition hat eine feste Größe: 1 GiB ab Layout gen4 (`docs/meltingplot-layout.md`, Festlegung 5), in gen3 waren es 512 MiB. Großzügig, weil sie sich nach der Installation nicht mehr ändern lässt. Die Hälfte ist für das eigene Log, die andere für die Kopie des Partners (AL-29). Das eigene Log teilt sich nach AL-40 auf die Klassen auf; das Archiv nach einer Löschung (AL-17) zählt zur Reserve. Schätzung im Normalbetrieb: unter 100 Einträge am Tag zu etwa 400 Byte, über fünf Jahre also unter 75 MB. Erst ab 80 % eines Anteils dürfen Einträge gekürzt werden, die älter als fünf Jahre Betriebszeit sind (AL-06, AL-49). Bei 80 % wird außerdem E17 gemeldet. Neue Einträge werden nie verworfen, höchstens nach AL-41 zusammengefasst. Ein volles Log hält die Maschine nicht an.
+- **AL-07** Die Partition hat eine feste Größe: 1 GiB ab Layout gen4 (`docs/meltingplot-layout.md`, Festlegung 5), in gen3 waren es 512 MiB. Großzügig, weil sie sich nach der Installation nicht mehr ändern lässt. 256 MiB sind für das eigene Log, ebenso viel für die Kopie des Partners (AL-29). Die Partition ist größer als diese 512 MiB, weil das Dateisystem selbst Platz braucht (Festlegung 26). Das eigene Log teilt sich nach AL-40 auf die Klassen auf; das Archiv nach einer Löschung (AL-17) zählt zur Reserve. Schätzung im Normalbetrieb: unter 100 Einträge am Tag zu etwa 400 Byte, über fünf Jahre also unter 75 MB. Erst ab 80 % eines Anteils dürfen Einträge gekürzt werden, die älter als fünf Jahre Betriebszeit sind (AL-06, AL-49). Bei 80 % wird außerdem E17 gemeldet. Neue Einträge werden nie verworfen, höchstens nach AL-41 zusammengefasst. Ein volles Log hält die Maschine nicht an.
 - **AL-08** Jeder Eintrag geht zusätzlich ins Journal, damit man ihn live sieht. Maßgeblich ist nur das Audit-Log.
 
 ### Aktivierung und Schutz vor Deaktivierung (T35, T36, T40, T41)
@@ -337,7 +338,7 @@ Die Gefahr ist die Flut: Schriebe jedes Ereignis einzeln mit `fsync`, kostet das
   - Zählerstände 42 GB, Betriebszeit 4 GB, Kopie des Partners 3 GB,
   - zusammen unter 75 GB.
 
-  Das sind etwa 40 MB am Tag, rund 5 % dessen, was das HMI heute ohnehin schreibt, und weit unter 0,1 % einer TBW von 100 TB. Die Partition bleibt bei 512 MiB.
+  Das sind etwa 40 MB am Tag, rund 5 % dessen, was das HMI heute ohnehin schreibt, und weit unter 0,1 % einer TBW von 100 TB. Die Partition muss dafür nicht größer werden; sie ist es ab gen4 wegen des Dateisystems (AL-07).
 - **AL-53** SOLL: Das System schreibt monatlich den Verschleiß des Datenträgers ins Log (E21): bei NVMe „Percentage Used“ und „Data Units Written“ aus den SMART-Daten. Das ist auch ein Nachweis, falls jemand den Datenträger zu verschleißen versucht. Die Audit-Partition ist nur im Namespace des Dienstes eingehängt. Der Dienst stößt TRIM für sie deshalb selbst an, weil `fstrim.timer` sie nicht sieht.
 - **AL-54** Läuft ein System von einer SD-Karte statt von NVMe, gilt dieselbe Grenze. Billige Karten verteilen Schreibvorgänge oft schlechter; für den Dauerbetrieb von SD sind Industriekarten (pSLC) vorzusehen. Die Betriebsanleitung nennt das.
 
