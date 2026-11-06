@@ -21,6 +21,8 @@ auditcore.py; this file is what ties it to the computer:
   every entry into the journal only and says so on every boot (AL-36).
 """
 
+import contextlib
+import ctypes
 import grp
 import hashlib
 import json
@@ -55,6 +57,9 @@ JOURNAL_SOCKET = ENV("MP_AUDIT_JOURNAL", "/run/systemd/journal/socket")
 JOURNALCTL = ENV("MP_AUDIT_JOURNALCTL", "journalctl")
 SYSTEMCTL = ENV("MP_AUDIT_SYSTEMCTL", "systemctl")
 CLOCK_JUMP = 60  # E16: a step of the system clock larger than this
+BLKID_NO_SIGNATURE = 2  # blkid -p --no-part-details: nothing at all on the partition
+E2FSCK_NOT_CORRECTED = 4  # e2fsck: from this exit status on, errors are left in the filesystem
+U32 = struct.Struct(">I")  # a number in the device tree
 
 
 def log(msg):
@@ -87,13 +92,13 @@ def journal_send(message, priority=6, **fields):
 
 
 def describe(e):
-    text = "%s %s" % (e.get("ev"), e.get("res"))
+    text = f"{e.get('ev')} {e.get('res')}"
     if e.get("msg"):
         text += ": " + e["msg"]
     if e.get("obj"):
-        text += " [%s]" % e["obj"]
+        text += f" [{e['obj']}]"
     if e.get("actor"):
-        text += " (%s)" % e["actor"]
+        text += f" ({e['actor']})"
     return text
 
 
@@ -101,10 +106,7 @@ def mirror(e, note=None):
     """Every entry goes to the journal at once, with its number, so it can
     be seen live and so a crash before it reached the partition still shows
     what was lost (AL-08, AL-11). Only the audit log is the proof."""
-    if e.get("res") in ("refused", "failed") or e.get("ev") == "E17":
-        prio = 4
-    else:
-        prio = 6
+    prio = 4 if e.get("res") in ("refused", "failed") or e.get("ev") == "E17" else 6
     text = describe(e) + (" - " + note if note else "")
     journal_send(
         text,
@@ -124,8 +126,8 @@ def conf(path):
     out = {}
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                line = line.strip().rstrip("\r")
+            for raw in f:
+                line = raw.strip().rstrip("\r")
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
@@ -146,15 +148,15 @@ def read_text(path):
 def read_u32(path):
     try:
         with open(path, "rb") as f:
-            raw = f.read(4)
-        return struct.unpack(">I", raw)[0] if len(raw) == 4 else None
+            raw = f.read(U32.size)
+        return U32.unpack(raw)[0] if len(raw) == U32.size else None
     except OSError:
         return None
 
 
 def run(cmd, timeout=600):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
         return p.returncode, p.stdout.strip(), p.stderr.strip()
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 127, "", str(exc)
@@ -171,7 +173,7 @@ class Computer:
         return {
             "sys": self.device.get("MP_ROLE", "sbc"),
             "host": socket.gethostname(),
-            "mach": "%s-%s" % (product, serial) if serial else "unprovisioned",
+            "mach": f"{product}-{serial}" if serial else "unprovisioned",
             "img": self.device.get("MP_VERSION", "") or "unknown",
         }
 
@@ -183,7 +185,7 @@ class Computer:
             st = os.stat("/")
         except OSError:
             return "unknown"
-        base = "/sys/dev/block/%d:%d" % (os.major(st.st_dev), os.minor(st.st_dev))
+        base = f"/sys/dev/block/{os.major(st.st_dev)}:{os.minor(st.st_dev)}"
         devices = [base]
         slaves = os.path.join(base, "slaves")
         if os.path.isdir(slaves):
@@ -207,7 +209,7 @@ class Computer:
 
     @staticmethod
     def committed():
-        rc, _, _ = run(["sh", "-c", ". %s && mp_slot_committed" % COMMON], 30)
+        rc, _, _ = run(["sh", "-c", f". {COMMON} && mp_slot_committed"], 30)
         return rc == 0
 
     def identity_data(self, dev):
@@ -221,9 +223,9 @@ class Computer:
         if dev:
             rc, pk, _ = run(["lsblk", "-ndo", "PKNAME", dev], 10)
             if rc == 0 and pk:
-                model = read_text("/sys/block/%s/device/model" % pk).strip()
-                serial = read_text("/sys/block/%s/device/serial" % pk).strip()
-                data["drive"] = ("%s %s" % (model, serial)).strip()
+                model = read_text(f"/sys/block/{pk}/device/model").strip()
+                serial = read_text(f"/sys/block/{pk}/device/serial").strip()
+                data["drive"] = (f"{model} {serial}").strip()
         return data
 
 
@@ -235,7 +237,7 @@ def mounted_elsewhere(dev):
     Only root can do that, and it is worth an entry."""
     try:
         st = os.stat(dev)
-        mm = "%d:%d" % (os.major(st.st_rdev), os.minor(st.st_rdev))
+        mm = f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
         with open("/proc/1/mountinfo") as f:
             return any(line.split()[2] == mm for line in f)
     except (OSError, IndexError):
@@ -259,51 +261,62 @@ def mount_store(notes):
         )
         return None, None
     dev = os.path.realpath(DEV)
+    if not (holds_ext4(dev, notes) and passes_fsck(dev, notes)):
+        return None, dev
+    os.makedirs(STORE, mode=0o700, exist_ok=True)
+    try:
+        sys_mount(dev, STORE)
+    except OSError as exc:
+        notes.append(("E17", "failed", f"cannot mount the audit partition: {exc}", {}))
+        return None, dev
+    return STORE, dev
+
+
+def holds_ext4(dev, notes):
+    """Whether the partition holds ext4 now, formatting it only if it holds
+    nothing at all (AL-37)."""
     # --no-part-details: in low-level mode blkid also reports the partition's
     # entry in the partition table and then exits 0 for an empty partition,
     # which would never be formatted (layout gen4 ships it without a
     # filesystem; found on the bench panel with hmi rc.15). Without them, 2
     # means no signature of any kind.
     rc, fstype, _ = run(["blkid", "-p", "--no-part-details", "-o", "value", "-s", "TYPE", dev], 30)
-    if rc == 2:
+    if rc == BLKID_NO_SIGNATURE:
         # Nothing at all on it: a first start after an installation that did
         # not bring a filesystem. Anything else is left as it is.
         rc, _, err = run(["mkfs.ext4", "-q", "-L", "AUDIT", dev])
         if rc != 0:
             notes.append(("E17", "failed", "cannot format the empty audit partition: " + err, {}))
-            return None, dev
+            return False
         notes.append(("E17", "info", "empty audit partition formatted", {}))
-    elif rc != 0 or fstype != "ext4":
-        notes.append(("E17", "failed", "audit partition holds %r, not ext4; left as it is" % fstype, {}))
-        return None, dev
+        return True
+    if rc != 0 or fstype != "ext4":
+        notes.append(("E17", "failed", f"audit partition holds {fstype!r}, not ext4; left as it is", {}))
+        return False
+    return True
+
+
+def passes_fsck(dev, notes):
+    """Whether the filesystem may be mounted. One mounted elsewhere cannot be
+    checked, and is worth an entry."""
     if mounted_elsewhere(dev):
         notes.append(("E17", "failed", "audit partition is mounted outside the audit service", {}))
-    else:
-        rc, _, err = run(["e2fsck", "-p", dev])
-        if rc >= 4:
-            # Damaged: it may be the proof, so it is never repaired by force
-            # or formatted (AL-37).
-            notes.append(
-                ("E17", "failed", "audit partition damaged (e2fsck %d), left as it is: %s" % (rc, err[:120]), {})
-            )
-            return None, dev
-        if rc:
-            notes.append(("E17", "info", "e2fsck repaired the audit partition (%d)" % rc, {}))
-    os.makedirs(STORE, mode=0o700, exist_ok=True)
-    try:
-        sys_mount(dev, STORE)
-    except OSError as exc:
-        notes.append(("E17", "failed", "cannot mount the audit partition: %s" % exc, {}))
-        return None, dev
-    return STORE, dev
+        return True
+    rc, _, err = run(["e2fsck", "-p", dev])
+    if rc >= E2FSCK_NOT_CORRECTED:
+        # Damaged: it may be the proof, so it is never repaired by force
+        # or formatted (AL-37).
+        notes.append(("E17", "failed", f"audit partition damaged (e2fsck {rc}), left as it is: {err[:120]}", {}))
+        return False
+    if rc:
+        notes.append(("E17", "info", f"e2fsck repaired the audit partition ({rc})", {}))
+    return True
 
 
 def sys_mount(dev, target):
     """mount(2) itself: mount(8) would record the mount in /run/mount/utab,
     which is read-only for this service and must not name a mount that
     exists only in its namespace."""
-    import ctypes
-
     libc = ctypes.CDLL(None, use_errno=True)
     ms_nosuid, ms_nodev, ms_noexec, ms_noatime = 2, 4, 8, 1024
     flags = ms_nosuid | ms_nodev | ms_noexec | ms_noatime
@@ -321,10 +334,8 @@ def journal_json(args):
         return []
     items = []
     for line in out.splitlines():
-        try:
+        with contextlib.suppress(ValueError):
             items.append(json.loads(line))
-        except ValueError:
-            pass
     return items
 
 
@@ -390,22 +401,22 @@ class Service:
         self.next_trial_check = 0
 
     # entries of the service itself, also without a partition
-    def record(self, ev, res, msg="", obj="", actor="", via="mp-auditd", data=None, sync=False, force=False):
+    def record(self, ev, res, msg="", *, sync=False, force=False, **fields):
+        """fields are obj, actor, data and via, which is this service unless given."""
+        fields.setdefault("via", "mp-auditd")
         if self.core is not None:
             try:
-                return self.core.record(
-                    ev, res, actor=actor, via=via, obj=obj, msg=msg, data=data, sync=sync, force=force
-                )
+                return self.core.record(ev, res, msg=msg, sync=sync, force=force, **fields)
             except ValueError as exc:
                 log(str(exc))
                 return 0
         e = {"ev": ev, "res": res, "cls": al.class_of(ev, res), "msg": al.clean(msg, 256)}
-        if obj:
-            e["obj"] = al.clean(obj, 256)
-        if actor:
-            e["actor"] = al.clean(actor, 64)
-        if data:
-            e["data"] = al.clean_data(data)
+        if fields.get("obj"):
+            e["obj"] = al.clean(fields["obj"], 256)
+        if fields.get("actor"):
+            e["actor"] = al.clean(fields["actor"], 64)
+        if fields.get("data"):
+            e["data"] = al.clean_data(fields["data"])
         mirror(e, "journal only, " + self.reason)
         return 0
 
@@ -413,41 +424,25 @@ class Service:
         notes = []
         root, dev = mount_store(notes)
         if root is None:
-            self.mode = "journal-only"
-            self.reason = notes[-1][2] if notes else "no audit partition"
-            for ev, res, msg, data in notes:
-                self.record(ev, res, msg, data=data)
+            self.journal_only(notes[-1][2] if notes else "no audit partition")
+            self.record_notes(notes)
             return
         self.core = ac.AuditCore(root, self.pc.ident, journal=mirror, append_only=not TEST_STORE)
         try:
             state = self.core.open(recover=lost_in_crash)
         except Exception as exc:  # noqa: BLE001 - never a restart loop over the proof
             self.core = None
-            self.mode = "journal-only"
-            self.reason = "audit log cannot be opened: %s" % exc
+            self.journal_only(f"audit log cannot be opened: {exc}")
             self.record("E17", "failed", self.reason)
-            for ev, res, msg, data in notes:
-                self.record(ev, res, msg, data=data)
+            self.record_notes(notes)
             return
         self.mode = "log"
         installer = self.installer()
         if state == "new":
-            data = self.pc.identity_data(dev)
-            if installer:
-                data.update(
-                    {
-                        "installer": installer.get("installer", ""),
-                        "installed": installer.get("installed", ""),
-                        "layout_before": installer.get("layout_before", ""),
-                        "kept": installer.get("kept", ""),
-                    }
-                )
-            start = self.core.genesis(data=data)
-            log("audit log created, start hash %s" % start)
+            self.create_log(dev, installer)
         for kind, text in self.core.notes:
             self.record("E17", "failed" if kind in ("write", "rekey", "missing") else "info", text, data={"kind": kind})
-        for ev, res, msg, data in notes:
-            self.record(ev, res, msg, data=data)
+        self.record_notes(notes)
         if installer and installer.get("_sha") != self.core.extra.get("installer_sha"):
             self.installation(installer, state)
         if state == "open":
@@ -460,6 +455,28 @@ class Service:
         self.core.flush()
         self.core.seal()
         self.core.save_state()
+
+    def journal_only(self, reason):
+        self.mode = "journal-only"
+        self.reason = reason
+
+    def record_notes(self, notes):
+        for ev, res, msg, data in notes:
+            self.record(ev, res, msg, data=data)
+
+    def create_log(self, dev, installer):
+        data = self.pc.identity_data(dev)
+        if installer:
+            data.update(
+                {
+                    "installer": installer.get("installer", ""),
+                    "installed": installer.get("installed", ""),
+                    "layout_before": installer.get("layout_before", ""),
+                    "kept": installer.get("kept", ""),
+                }
+            )
+        start = self.core.genesis(data=data)
+        log(f"audit log created, start hash {start}")
 
     # E18 (AL-18): what the installer card found on the drive
     def installer(self):
@@ -480,13 +497,13 @@ class Service:
         elif kept:
             msg, res = "reinstallation, the kept audit partition held no readable log", "failed"
         elif before in ("gen1", "gen2"):
-            msg, res = "installation over layout %s, no earlier audit log" % before, "done"
+            msg, res = f"installation over layout {before}, no earlier audit log", "done"
         elif before == "gen3":
             msg, res = "installation over layout gen3 without keeping its audit log", "done"
         elif before == "blank":
             msg, res = "installation on an empty drive", "done"
         else:
-            msg, res = "installation over a drive with layout %r" % (before or "unknown"), "done"
+            msg, res = f"installation over a drive with layout {before or 'unknown'!r}", "done"
         data = {
             k: info.get(k, "")
             for k in ("image", "sha256", "installer", "installed", "layout_before", "keep_part", "kept", "drive")
@@ -506,7 +523,7 @@ class Service:
             self.record(
                 "E17",
                 "info",
-                "the audit service started again within this boot, %s s after its stop" % data.get("gap", "?"),
+                f"the audit service started again within this boot, {data.get('gap', '?')} s after its stop",
                 data=data,
             )
         if not core.prev_clean and core.prev_bid:
@@ -516,7 +533,7 @@ class Service:
                     "E15",
                     "info",
                     "the previous boot ended without a clean stop of the audit log",
-                    data={"boot": core.boot - 1, "rsts": "%08x" % rsts if rsts is not None else ""},
+                    data={"boot": core.boot - 1, "rsts": f"{rsts:08x}" if rsts is not None else ""},
                 )
             else:
                 self.record("E17", "failed", "the audit service was restarted without a clean stop")
@@ -525,8 +542,8 @@ class Service:
             self.record(
                 "E17",
                 "failed",
-                "%d entries accepted before the crash did not reach the audit partition; "
-                "%d recovered from the journal" % (core.lost, len(seen)),
+                f"{core.lost} entries accepted before the crash did not reach the audit partition; "
+                f"{len(seen)} recovered from the journal",
                 data={"lost": core.lost, "recovered": len(seen)},
                 force=True,
             )
@@ -566,7 +583,7 @@ class Service:
                     self.record(
                         "E02",
                         "done",
-                        "image %s committed after its trial boot" % trial.get("to", ""),
+                        f"image {trial.get('to', '')} committed after its trial boot",
                         obj=trial.get("to", ""),
                         data=trial,
                     )
@@ -575,8 +592,8 @@ class Service:
                 self.record(
                     "E02",
                     "failed",
-                    "trial boot of %s in %s was not committed, now %s in %s"
-                    % (trial.get("to"), trial.get("slot"), cur.get("version"), cur.get("slot")),
+                    f"trial boot of {trial.get('to')} in {trial.get('slot')} was not committed, "
+                    f"now {cur.get('version')} in {cur.get('slot')}",
                     obj=trial.get("to", ""),
                     data=trial,
                 )
@@ -592,7 +609,7 @@ class Service:
             self.record(
                 "E02",
                 "done",
-                "image %s started in %s" % (cur.get("version"), cur.get("slot")),
+                f"image {cur.get('version')} started in {cur.get('slot')}",
                 obj=cur.get("name", ""),
                 data=data,
             )
@@ -612,7 +629,7 @@ class Service:
             self.record(
                 "E02",
                 "done",
-                "image %s committed after its trial boot" % trial.get("to", ""),
+                f"image {trial.get('to', '')} committed after its trial boot",
                 obj=trial.get("to", ""),
                 data=trial,
             )
@@ -632,11 +649,11 @@ class Service:
                 data["from"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.last_off + boot))
                 data["delta"] = int(off - self.last_off)
             if first_sync and jump:
-                msg = "system clock synchronised, moved by %d s" % data["delta"]
+                msg = f"system clock synchronised, moved by {data['delta']} s"
             elif first_sync:
                 msg = "system clock synchronised"
             else:
-                msg = "system clock set, moved by %d s" % data["delta"]
+                msg = f"system clock set, moved by {data['delta']} s"
             self.record("E16", "done" if jump else "info", msg, data=data)
         if synced and not self.synced_once:
             self.synced_once = True
@@ -693,7 +710,7 @@ class Service:
                 self.core.tick()
                 if len(self.core.notes) > noted:
                     for kind, text in self.core.notes[noted:]:
-                        journal_send("audit log fault (%s): %s" % (kind, text), 3)
+                        journal_send(f"audit log fault ({kind}): {text}", 3)
                     noted = len(self.core.notes)
                 self.watch_trial()
             self.watch_clock()
@@ -701,10 +718,8 @@ class Service:
         sd_notify("STOPPING=1")
         server.shutdown()
         server.server_close()
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(SOCK)
-        except OSError:
-            pass
         system = self.system_state()
         if system != "stopping":
             # Written and sealed by the close below; the next start in this
@@ -726,6 +741,9 @@ class Handler(socketserver.StreamRequestHandler):
     def reply(self, obj):
         self.wfile.write((json.dumps(obj, sort_keys=True) + "\n").encode())
 
+    def refuse(self, error):
+        self.reply({"ok": False, "error": error})
+
     def handle(self):
         svc = self.server.svc
         self.request.settimeout(10)
@@ -736,79 +754,86 @@ class Handler(socketserver.StreamRequestHandler):
             if not isinstance(req, dict):
                 raise ValueError("not an object")
         except (OSError, ValueError) as exc:
-            self.reply({"ok": False, "error": "bad request: %s" % exc})
+            self.refuse(f"bad request: {exc}")
             return
         cmd = req.get("cmd")
+        # A command is whatever JSON the caller sent, so not always hashable.
+        command = self.COMMANDS.get(cmd) if isinstance(cmd, str) else None
         try:
-            if cmd == "record":
-                if uid != 0:
-                    self.reply({"ok": False, "error": "only root records"})
-                    return
-                if req.get("ev") not in al.EVENTS or req.get("res") not in al.RESULTS:
-                    self.reply({"ok": False, "error": "unknown event or result"})
-                    return
-                via = req.get("via") or read_text("/proc/%d/comm" % pid)
-                seq = svc.record(
-                    req.get("ev"),
-                    req.get("res"),
-                    msg=req.get("msg", ""),
-                    obj=req.get("obj", ""),
-                    actor=req.get("actor", ""),
-                    via=via,
-                    data=req.get("data"),
-                    sync=bool(req.get("sync")),
-                )
-                self.reply({"ok": True, "seq": seq, "mode": svc.mode})
-            elif cmd == "status":
-                self.reply(dict(svc.status(), ok=True))
-            elif cmd == "read":
-                if svc.core is None:
-                    self.reply({"ok": False, "error": svc.reason})
-                    return
-                # With the summaries still open at this moment, so a check
-                # accounts for every number (AL-41).
-                opened, snap = svc.core.read_snapshot()
-                self.reply({"ok": True, "start": svc.core.start, "open": opened})
-                for line in svc.core.lines(snap):
-                    self.wfile.write(line.encode("utf-8", "surrogateescape") + b"\n")
-            elif cmd == "seal":
-                if uid != 0 or svc.core is None:
-                    self.reply({"ok": False, "error": "not possible"})
-                    return
-                svc.core.seal()
-                self.reply({"ok": True})
-            elif cmd == "reset":
-                reason = al.clean(req.get("reason", ""), 200).strip()
-                if uid != 0 or svc.core is None or not reason:
-                    self.reply({"ok": False, "error": "a reset needs root, the audit partition and a reason"})
-                    return
-                start = svc.core.reset(reason, req.get("actor", "") or "uid 0", data=svc.pc.identity_data(None))
-                self.reply({"ok": True, "start": start, "fingerprint": al.fingerprint(start)})
+            if command is None:
+                self.refuse(f"unknown command {cmd!r}")
             else:
-                self.reply({"ok": False, "error": "unknown command %r" % cmd})
+                command(self, svc, req, pid, uid)
         except ValueError as exc:
-            self.reply({"ok": False, "error": str(exc)})
+            self.refuse(str(exc))
         except OSError:
             pass
+
+    def do_record(self, svc, req, pid, uid):
+        if uid != 0:
+            self.refuse("only root records")
+            return
+        if req.get("ev") not in al.EVENTS or req.get("res") not in al.RESULTS:
+            self.refuse("unknown event or result")
+            return
+        via = req.get("via") or read_text(f"/proc/{pid}/comm")
+        seq = svc.record(
+            req.get("ev"),
+            req.get("res"),
+            msg=req.get("msg", ""),
+            obj=req.get("obj", ""),
+            actor=req.get("actor", ""),
+            via=via,
+            data=req.get("data"),
+            sync=bool(req.get("sync")),
+        )
+        self.reply({"ok": True, "seq": seq, "mode": svc.mode})
+
+    def do_status(self, svc, _req, _pid, _uid):
+        self.reply(dict(svc.status(), ok=True))
+
+    def do_read(self, svc, _req, _pid, _uid):
+        if svc.core is None:
+            self.refuse(svc.reason)
+            return
+        # With the summaries still open at this moment, so a check
+        # accounts for every number (AL-41).
+        opened, snap = svc.core.read_snapshot()
+        self.reply({"ok": True, "start": svc.core.start, "open": opened})
+        for line in svc.core.lines(snap):
+            self.wfile.write(line.encode("utf-8", "surrogateescape") + b"\n")
+
+    def do_seal(self, svc, _req, _pid, uid):
+        if uid != 0 or svc.core is None:
+            self.refuse("not possible")
+            return
+        svc.core.seal()
+        self.reply({"ok": True})
+
+    def do_reset(self, svc, req, _pid, uid):
+        reason = al.clean(req.get("reason", ""), 200).strip()
+        if uid != 0 or svc.core is None or not reason:
+            self.refuse("a reset needs root, the audit partition and a reason")
+            return
+        start = svc.core.reset(reason, req.get("actor", "") or "uid 0", data=svc.pc.identity_data(None))
+        self.reply({"ok": True, "start": start, "fingerprint": al.fingerprint(start)})
+
+    COMMANDS = {"record": do_record, "status": do_status, "read": do_read, "seal": do_seal, "reset": do_reset}
 
 
 class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
 
     def __init__(self, path, svc):
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(path)
-        except FileNotFoundError:
-            pass
         old = os.umask(0o117)
         try:
             super().__init__(path, Handler)
         finally:
             os.umask(old)
-        try:
+        with contextlib.suppress(KeyError, OSError):
             os.chown(path, 0, grp.getgrnam("adm").gr_gid)
-        except (KeyError, OSError):
-            pass
         os.chmod(path, 0o660)
         self.svc = svc
 

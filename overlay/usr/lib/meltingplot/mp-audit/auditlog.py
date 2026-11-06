@@ -118,6 +118,11 @@ def unb64(text):
 
 # --- strings from outside (AL-02) ---------------------------------------------
 
+# Control characters: C0, DEL and C1.
+C0_END = 0x20
+DEL = 0x7F
+C1_START, C1_END = 0x80, 0xA0
+
 
 def clean(value, limit):
     """Bounded and free of control characters. Never interpreted."""
@@ -125,8 +130,8 @@ def clean(value, limit):
     out = []
     for ch in text[:limit]:
         o = ord(ch)
-        if o < 0x20 or o == 0x7F or 0x80 <= o < 0xA0:
-            out.append("\\x%02x" % o)
+        if o < C0_END or o == DEL or C1_START <= o < C1_END:
+            out.append(f"\\x{o:02x}")
         else:
             out.append(ch)
     text = "".join(out)[:limit]
@@ -143,9 +148,7 @@ def clean_data(data, keys=16, limit=256):
     for k in sorted(data)[:keys]:
         key = clean(k, 24)
         v = data[k]
-        if isinstance(v, bool) or v is None:
-            out[key] = v
-        elif isinstance(v, int) and abs(v) < 2**63:
+        if isinstance(v, bool) or v is None or (isinstance(v, int) and abs(v) < 2**63):
             out[key] = v
         else:
             out[key] = clean(v, limit)
@@ -297,164 +300,206 @@ def verify(lines, start=None, open_summaries=None):
     for a log read from files, a shortfall is accepted only as far as E19
     entries announce summaries that no summary entry has closed yet.
     """
-    rep = Report()
-    announced = {}  # E19 not yet followed by its summary entry
-    gaps = []  # (first, last) of numbers no entry carries
-    rep.start_expected = start
-    prev = ZERO
-    pub = None
-    epoch = 0
-    epoch_ok = True
-    pending_torn = None  # (line number, hash) of an unreadable line
+    check = _Check(start)
     for n, raw in enumerate(lines, 1):
+        check.line(n, raw)
+    return check.finish(open_summaries)
+
+
+class _Check:
+    """One pass over a log for verify(): what is carried from line to line."""
+
+    def __init__(self, start):
+        self.rep = Report()
+        self.rep.start_expected = start
+        self.announced = {}  # E19 not yet followed by its summary entry
+        self.gaps = []  # (first, last) of numbers no entry carries
+        self.prev = ZERO
+        self.pub = None
+        self.epoch = 0
+        self.epoch_ok = True
+        self.pending_torn = None  # (line number, hash) of an unreadable line
+
+    def _note(self, n, text):
+        self.rep.problems.append((n, self.epoch, text))
+
+    def _damage(self, n, text):
+        """A problem that leaves the open epoch without proof."""
+        self._note(n, text)
+        self.epoch_ok = False
+
+    def line(self, n, raw):
         line = raw.rstrip("\n")
         if not line:
-            continue
-        rep.lines += 1
+            return
+        self.rep.lines += 1
         try:
             obj = json.loads(line)
             if not isinstance(obj, dict):
                 raise ValueError("not an object")
         except ValueError:
-            # A write cut short by a crash. The service writes an E17 right
-            # after it that names its hash and chains past it; anything else
-            # is damage.
-            if pending_torn:
-                rep.problems.append((pending_torn[0], epoch, "unreadable line"))
-                epoch_ok = False
-            pending_torn = (n, line_hash(line))
-            continue
-        if pending_torn:
-            torn_hash = obj.get("data", {}).get("torn_sha256") if isinstance(obj.get("data"), dict) else None
-            if obj.get("ev") == "E17" and torn_hash == pending_torn[1]:
-                rep.torn += 1
-            else:
-                rep.problems.append((pending_torn[0], epoch, "unreadable line"))
-                epoch_ok = False
-            pending_torn = None
-
-        if obj.get("prev") != prev:
-            rep.problems.append((n, epoch, "does not chain to the line before"))
-            epoch_ok = False
+            self._unreadable(n, line)
+            return
+        self._after_unreadable(obj)
+        if obj.get("prev") != self.prev:
+            self._damage(n, "does not chain to the line before")
         h = line_hash(line)
-
-        if rep.lines == 1:
-            gen = obj.get("genesis")
-            if obj.get("ev") != "E01" or not isinstance(gen, dict):
-                rep.problems.append((n, epoch, "first line is not a genesis entry"))
-                epoch_ok = False
-            else:
-                if gen.get("alg") != ALG or gen.get("format") != FORMAT:
-                    rep.problems.append((n, epoch, "unknown format or algorithm"))
-                    epoch_ok = False
-                pub = gen.get("pub")
-            rep.start = h
-
+        if self.rep.lines == 1:
+            self._first_line(n, obj, h)
         if "seal" in obj:
-            rep.seals += 1
-            if obj.get("seal") != epoch:
-                rep.problems.append((n, epoch, "seal of epoch %s where %d was due" % (obj.get("seal"), epoch)))
-                epoch_ok = False
-            if pub is None or not signature_valid(pub, obj.get("sig", ""), seal_payload(obj)):
-                rep.problems.append((n, epoch, "seal not signed by the key of its epoch"))
-                epoch_ok = False
-            if epoch_ok:
-                rep.epochs_valid += 1
-            pub = obj.get("next")
-            epoch += 1
-            epoch_ok = True
-            rep.unsealed = 0
+            self._seal(n, obj)
         elif "rekey" in obj:
-            # The service lost the key of the open epoch and continues with
-            # a new one nobody vouched for. Valid in form, but whatever the
-            # epoch held can no longer be shown to be unaltered.
-            rep.rekeys += 1
-            rep.problems.append((n, epoch, "new key without a seal: epoch %d is not verifiable" % epoch))
-            pub = obj.get("next")
-            epoch += 1
-            epoch_ok = True
-            rep.unsealed = 0
+            self._rekey(n, obj)
         else:
-            seq = obj.get("seq")
-            if not isinstance(seq, int) or seq <= rep.last_seq:
-                rep.problems.append((n, epoch, "sequence number %r out of order" % (seq,)))
-                epoch_ok = False
-            else:
-                if seq > rep.last_seq + 1:
-                    gaps.append((rep.last_seq + 1, seq - 1))
-                rep.last_seq = seq
-            rep.entries += 1
-            rep.unsealed += 1
-            rep.accounted += 1
-            agg = obj.get("agg")
-            if isinstance(agg, dict) and isinstance(agg.get("n"), int):
-                rep.accounted += agg["n"]
-                rep.aggregated += agg["n"]
-            data = obj.get("data")
-            if obj.get("ev") == "E17" and isinstance(data, dict) and isinstance(data.get("lost"), int):
-                rep.accounted += data["lost"]
-                rep.lost += data["lost"]
-            if obj.get("ev") == "E19" and isinstance(data, dict):
-                key = "%s/%s" % (data.get("class"), data.get("event"))
-                first = data.get("from")
-                announced[first if isinstance(first, int) else key] = key
-            if isinstance(agg, dict):
-                # closed: by its first number, or, in logs from before
-                # E19 named it, by class and id
-                key = "%s/%s" % (obj.get("cls"), obj.get("ev"))
-                first = agg.get("from")
-                if isinstance(first, int) and first in announced:
-                    del announced[first]
-                elif key in announced:
-                    del announced[key]
-        prev = h
-        rep.last_hash = h
+            self._entry(n, obj)
+        self.prev = h
+        self.rep.last_hash = h
 
-    if pending_torn:
-        # Cut short at the very end, nothing written after: the crash the
-        # service has not yet come back from. Not an alteration.
-        rep.torn += 1
-    short = rep.last_seq - rep.accounted
-    if open_summaries is not None:
-        # From the service, at the moment the lines were read: each number up
-        # to the highest it handed out is on the disk or in one of these.
+    def _unreadable(self, n, line):
+        """A write cut short by a crash. The service writes an E17 right
+        after it that names its hash and chains past it; anything else is
+        damage."""
+        if self.pending_torn:
+            self._damage(self.pending_torn[0], "unreadable line")
+        self.pending_torn = (n, line_hash(line))
+
+    def _after_unreadable(self, obj):
+        if not self.pending_torn:
+            return
+        n, torn_hash = self.pending_torn
+        data = obj.get("data")
+        named = data.get("torn_sha256") if isinstance(data, dict) else None
+        if obj.get("ev") == "E17" and named == torn_hash:
+            self.rep.torn += 1
+        else:
+            self._damage(n, "unreadable line")
+        self.pending_torn = None
+
+    def _first_line(self, n, obj, h):
+        gen = obj.get("genesis")
+        if obj.get("ev") != "E01" or not isinstance(gen, dict):
+            self._damage(n, "first line is not a genesis entry")
+        else:
+            if gen.get("alg") != ALG or gen.get("format") != FORMAT:
+                self._damage(n, "unknown format or algorithm")
+            self.pub = gen.get("pub")
+        self.rep.start = h
+
+    def _next_epoch(self, obj):
+        self.pub = obj.get("next")
+        self.epoch += 1
+        self.epoch_ok = True
+        self.rep.unsealed = 0
+
+    def _seal(self, n, obj):
+        self.rep.seals += 1
+        if obj.get("seal") != self.epoch:
+            self._damage(n, f"seal of epoch {obj.get('seal')} where {self.epoch} was due")
+        if self.pub is None or not signature_valid(self.pub, obj.get("sig", ""), seal_payload(obj)):
+            self._damage(n, "seal not signed by the key of its epoch")
+        if self.epoch_ok:
+            self.rep.epochs_valid += 1
+        self._next_epoch(obj)
+
+    def _rekey(self, n, obj):
+        """The service lost the key of the open epoch and continues with a new
+        one nobody vouched for. Valid in form, but whatever the epoch held can
+        no longer be shown to be unaltered."""
+        self.rep.rekeys += 1
+        self._note(n, f"new key without a seal: epoch {self.epoch} is not verifiable")
+        self._next_epoch(obj)
+
+    def _entry(self, n, obj):
+        rep = self.rep
+        seq = obj.get("seq")
+        if not isinstance(seq, int) or seq <= rep.last_seq:
+            self._damage(n, f"sequence number {seq!r} out of order")
+        else:
+            if seq > rep.last_seq + 1:
+                self.gaps.append((rep.last_seq + 1, seq - 1))
+            rep.last_seq = seq
+        rep.entries += 1
+        rep.unsealed += 1
+        rep.accounted += 1
+        self._count_held(obj)
+        self._track_announced(obj)
+
+    def _count_held(self, obj):
+        """The numbers this entry stands for besides its own."""
+        rep = self.rep
+        agg = obj.get("agg")
+        if isinstance(agg, dict) and isinstance(agg.get("n"), int):
+            rep.accounted += agg["n"]
+            rep.aggregated += agg["n"]
+        data = obj.get("data")
+        if obj.get("ev") == "E17" and isinstance(data, dict) and isinstance(data.get("lost"), int):
+            rep.accounted += data["lost"]
+            rep.lost += data["lost"]
+
+    def _track_announced(self, obj):
+        data = obj.get("data")
+        if obj.get("ev") == "E19" and isinstance(data, dict):
+            key = f"{data.get('class')}/{data.get('event')}"
+            first = data.get("from")
+            self.announced[first if isinstance(first, int) else key] = key
+        agg = obj.get("agg")
+        if isinstance(agg, dict):
+            # closed: by its first number, or, in logs from before
+            # E19 named it, by class and id
+            key = f"{obj.get('cls')}/{obj.get('ev')}"
+            first = agg.get("from")
+            if isinstance(first, int) and first in self.announced:
+                del self.announced[first]
+            elif key in self.announced:
+                del self.announced[key]
+
+    def finish(self, open_summaries):
+        rep = self.rep
+        if self.pending_torn:
+            # Cut short at the very end, nothing written after: the crash the
+            # service has not yet come back from. Not an alteration.
+            rep.torn += 1
+        short = rep.last_seq - rep.accounted
+        if open_summaries is not None:
+            self._from_service(open_summaries)
+        elif short > 0 and self.announced and short >= len(self.announced):
+            self._from_files(short)
+        elif short != 0:
+            # :d here and below: a number in the log can be JSON true, and is one.
+            self._note(rep.lines, f"{rep.accounted} events counted, {rep.last_seq:d} numbered")
+        return rep
+
+    def _from_service(self, open_summaries):
+        """From the service, at the moment the lines were read: each number up
+        to the highest it handed out is on the disk or in one of these."""
+        rep = self.rep
         top = max([rep.last_seq] + [o.get("to") or 0 for o in open_summaries])
         held = sum(o.get("n", 0) for o in open_summaries)
         if rep.accounted + held != top:
-            rep.problems.append(
-                (
-                    rep.lines,
-                    epoch,
-                    "%d events counted and %d in open summaries, %d numbered" % (rep.accounted, held, top),
-                )
-            )
+            self._note(rep.lines, f"{rep.accounted} events counted and {held} in open summaries, {top:d} numbered")
         else:
             rep.last_seq = top
             rep.pending = held
             rep.pending_keys = [o.get("key", "") for o in open_summaries]
-    elif short > 0 and announced and short >= len(announced):
-        # Each announced summary holds at least the number before its E19,
-        # and none a number before its first. What is missing before the
-        # earliest of them has to be in the summaries written or declared
-        # lost; only the rest may be in the open ones.
-        firsts = [k for k in announced if isinstance(k, int)]
-        if firsts and len(firsts) == len(announced):
+
+    def _from_files(self, short):
+        """Each announced summary holds at least the number before its E19,
+        and none a number before its first. What is missing before the
+        earliest of them has to be in the summaries written or declared lost;
+        only the rest may be in the open ones."""
+        rep = self.rep
+        firsts = [k for k in self.announced if isinstance(k, int)]
+        if firsts and len(firsts) == len(self.announced):
             first = min(firsts)
-            before = sum(min(b, first - 1) - a + 1 for a, b in gaps if a < first)
+            before = sum(min(b, first - 1) - a + 1 for a, b in self.gaps if a < first)
             explained = rep.aggregated + rep.lost
             if before > explained:
-                rep.problems.append(
-                    (
-                        rep.lines,
-                        epoch,
-                        "%d numbers missing before the first open summary (%d), "
-                        "%d in summaries written or declared lost" % (before, first, explained),
-                    )
+                self._note(
+                    rep.lines,
+                    f"{before} numbers missing before the first open summary ({first:d}), "
+                    f"{explained} in summaries written or declared lost",
                 )
         if not rep.problems:
             rep.pending = short
-            rep.pending_keys = sorted(set(announced.values()))
+            rep.pending_keys = sorted(set(self.announced.values()))
             rep.confirmed = False
-    elif short != 0:
-        rep.problems.append((rep.lines, epoch, "%d events counted, %d numbered" % (rep.accounted, rep.last_seq)))
-    return rep

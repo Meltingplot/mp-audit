@@ -87,7 +87,7 @@ def request(req, stream=False):
 def journal_queue(req):
     """AL-35: the entry waits in the journal for the service."""
     fields = {
-        "MESSAGE": "queued for the audit log: %s %s %s" % (req["ev"], req["res"], req.get("msg", "")),
+        "MESSAGE": f"queued for the audit log: {req['ev']} {req['res']} {req.get('msg', '')}",
         "PRIORITY": "5",
         "SYSLOG_IDENTIFIER": "mp-audit-record",
         "MP_AUDIT_PENDING": "1",
@@ -95,40 +95,55 @@ def journal_queue(req):
     }
     data = b""
     for k, v in fields.items():
-        v = v.encode("utf-8", "replace")
-        if b"\n" in v:
-            data += k.encode() + b"\n" + struct.pack("<Q", len(v)) + v + b"\n"
+        raw = v.encode("utf-8", "replace")
+        if b"\n" in raw:
+            data += k.encode() + b"\n" + struct.pack("<Q", len(raw)) + raw + b"\n"
         else:
-            data += k.encode() + b"=" + v + b"\n"
+            data += k.encode() + b"=" + raw + b"\n"
     with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
         s.sendto(data, JOURNAL_SOCKET)
 
 
 def parent_comm():
     try:
-        with open("/proc/%d/comm" % os.getppid()) as f:
+        with open(f"/proc/{os.getppid()}/comm") as f:
             return f.read().strip()
     except OSError:
         return ""
 
 
+def complain(text, status):
+    print(f"mp-audit: {text}", file=sys.stderr)
+    return status
+
+
+def record_problem(args):
+    """What is wrong with the arguments of record, if anything."""
+    if args.event not in al.EVENTS:
+        return f"unknown event {args.event}"
+    if args.result not in al.RESULTS:
+        return f"result must be one of {', '.join(al.RESULTS)}"
+    if any("=" not in kv for kv in args.data or []):
+        return "--data takes KEY=VALUE"
+    return None
+
+
+def queue_record(req, why):
+    req["t"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        journal_queue(req)
+    except OSError:
+        return complain(f"audit service not reachable ({why}), and the journal neither", 1)
+    return complain("audit service not reachable, entry queued in the journal", 0)
+
+
 def cmd_record(args):
     if UID != 0:
-        print("mp-audit: only root records", file=sys.stderr)
-        return 2
-    if args.event not in al.EVENTS:
-        print("mp-audit: unknown event %s" % args.event, file=sys.stderr)
-        return 1
-    if args.result not in al.RESULTS:
-        print("mp-audit: result must be one of %s" % ", ".join(al.RESULTS), file=sys.stderr)
-        return 1
-    data = {}
-    for kv in args.data or []:
-        if "=" not in kv:
-            print("mp-audit: --data takes KEY=VALUE", file=sys.stderr)
-            return 1
-        k, v = kv.split("=", 1)
-        data[k] = v
+        return complain("only root records", 2)
+    problem = record_problem(args)
+    if problem:
+        return complain(problem, 1)
+    data = dict(kv.split("=", 1) for kv in args.data or [])
     req = {
         "cmd": "record",
         "ev": args.event,
@@ -143,17 +158,9 @@ def cmd_record(args):
     try:
         reply, _ = request(req)
     except Unreachable as exc:
-        req["t"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        try:
-            journal_queue(req)
-        except OSError:
-            print("mp-audit: audit service not reachable (%s), and the journal neither" % exc, file=sys.stderr)
-            return 1
-        print("mp-audit: audit service not reachable, entry queued in the journal", file=sys.stderr)
-        return 0
+        return queue_record(req, exc)
     if not reply.get("ok"):
-        print("mp-audit: %s" % reply.get("error"), file=sys.stderr)
-        return 2
+        return complain(reply.get("error"), 2)
     return 0
 
 
@@ -185,22 +192,22 @@ def format_entry(e):
     t = (e.get("t") or "").replace("T", " ")
     if not e.get("sync", True):
         t += "?"  # the clock was not synchronised (AL-01)
-    head = "%7s %-21s %-3s %-10s" % (e.get("seq"), t, e.get("ev"), e.get("res"))
+    head = f"{e.get('seq')!s:>7} {t!s:<21} {e.get('ev')!s:<3} {e.get('res')!s:<10}"
     who = e.get("actor") or e.get("via") or ""
     if e.get("agg"):
         a = e["agg"]
-        top = ", ".join("%s x%d" % (k or "-", c) for k, c in a.get("src", [])[:3])
-        body = "%d events %s .. %s; sources: %s" % (a.get("n", 0), a.get("t0"), a.get("t1"), top)
-        return "%s %s" % (head, body)
+        top = ", ".join(f"{k or '-'} x{c}" for k, c in a.get("src", [])[:3])
+        body = f"{a.get('n', 0)} events {a.get('t0')} .. {a.get('t1')}; sources: {top}"
+        return f"{head} {body}"
     body = " ".join(x for x in (short(who, 20), short(e.get("obj"), 40), e.get("msg") or "") if x)
-    return "%s %s" % (head, body)
+    return f"{head} {body}"
 
 
 def cmd_show(args):
     try:
         lines, _, _ = read_log(args.files)
     except (Unreachable, OSError) as exc:
-        print("mp-audit: %s" % exc, file=sys.stderr)
+        print(f"mp-audit: {exc}", file=sys.stderr)
         return 1
     want = set(args.ev or [])
     for line in lines:
@@ -215,8 +222,8 @@ def cmd_show(args):
             if args.seals:
                 kind = "seal" if "seal" in e else "REKEY"
                 print(
-                    "        %-21s %s of epoch %s"
-                    % ((e.get("t") or "").replace("T", " "), kind, e.get("seal", e.get("rekey")))
+                    f"        {(e.get('t') or '').replace('T', ' ')!s:<21} "
+                    f"{kind} of epoch {e.get('seal', e.get('rekey'))}"
                 )
             continue
         if want and e.get("ev") not in want:
@@ -232,43 +239,36 @@ def cmd_verify(args):
     try:
         lines, start, opened = read_log(args.files)
     except (Unreachable, OSError) as exc:
-        print("mp-audit: %s" % exc, file=sys.stderr)
+        print(f"mp-audit: {exc}", file=sys.stderr)
         return 1
     rep = al.verify(lines, args.start, opened)
     if args.json:
         print(json.dumps(rep.as_dict(), indent=2, sort_keys=True))
     else:
-        print("result       %s" % rep.result)
+        print(f"result       {rep.result}")
         if rep.start:
-            print("start hash   %s" % rep.start)
-            print("fingerprint  %s" % al.fingerprint(rep.start))
+            print(f"start hash   {rep.start}")
+            print(f"fingerprint  {al.fingerprint(rep.start)}")
         if args.start:
-            print("anchor       %s (%s)" % (args.start, "matches" if rep.start == args.start else "DOES NOT MATCH"))
+            print(f"anchor       {args.start} ({'matches' if rep.start == args.start else 'DOES NOT MATCH'})")
         else:
             print(
                 "anchor       none given: the check shows the log is intact from its start, "
                 "not that it is the log anchored on the nameplate"
             )
-        print(
-            "lines        %d: %d entries, %d seals, %d epochs valid"
-            % (rep.lines, rep.entries, rep.seals, rep.epochs_valid)
-        )
-        print("open epoch   %d entries not sealed yet" % rep.unsealed)
-        print("numbers      1..%d, %d counted in summaries, %d lost" % (rep.last_seq, rep.aggregated, rep.lost))
+        print(f"lines        {rep.lines}: {rep.entries} entries, {rep.seals} seals, {rep.epochs_valid} epochs valid")
+        print(f"open epoch   {rep.unsealed} entries not sealed yet")
+        print(f"numbers      1..{rep.last_seq:d}, {rep.aggregated} counted in summaries, {rep.lost} lost")
         if rep.pending:
             print(
-                "open         %d %s in summaries not written yet (%s)%s"
-                % (
-                    rep.pending,
-                    "counted" if opened is not None else "at least",
-                    ", ".join(rep.pending_keys),
-                    "" if opened is not None else "; announced by E19, only the device can confirm them",
-                )
+                f"open         {rep.pending} {'counted' if opened is not None else 'at least'} "
+                f"in summaries not written yet ({', '.join(rep.pending_keys)})"
+                f"{'' if opened is not None else '; announced by E19, only the device can confirm them'}"
             )
         if rep.torn:
-            print("torn writes  %d" % rep.torn)
+            print(f"torn writes  {rep.torn}")
         for n, epoch, text in rep.problems:
-            print("PROBLEM      line %d, epoch %d: %s" % (n, epoch, text))
+            print(f"PROBLEM      line {n}, epoch {epoch}: {text}")
     return 0 if rep.result in ("valid", "unsealed", "pending") else 3
 
 
@@ -276,15 +276,13 @@ def cmd_genesis(args):
     try:
         reply, _ = request({"cmd": "status"})
     except Unreachable as exc:
-        print("mp-audit: %s" % exc, file=sys.stderr)
+        print(f"mp-audit: {exc}", file=sys.stderr)
         return 1
     if not reply.get("start"):
-        print(
-            "mp-audit: no audit log on this computer (%s)" % (reply.get("reason") or reply.get("mode")), file=sys.stderr
-        )
+        print(f"mp-audit: no audit log on this computer ({reply.get('reason') or reply.get('mode')})", file=sys.stderr)
         return 1
-    print("start hash   %s" % reply["start"])
-    print("fingerprint  %s" % reply["fingerprint"])
+    print(f"start hash   {reply['start']}")
+    print(f"fingerprint  {reply['fingerprint']}")
     return 0
 
 
@@ -292,24 +290,24 @@ def cmd_status(args):
     try:
         reply, _ = request({"cmd": "status"})
     except Unreachable as exc:
-        print("mp-audit: audit service not reachable: %s" % exc, file=sys.stderr)
+        print(f"mp-audit: audit service not reachable: {exc}", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(reply, indent=2, sort_keys=True))
         return 0 if reply.get("mode") == "log" and reply.get("healthy") else 2
-    print("mode         %s%s" % (reply.get("mode"), (" - " + reply["reason"]) if reply.get("reason") else ""))
+    print(f"mode         {reply.get('mode')}{(' - ' + reply['reason']) if reply.get('reason') else ''}")
     if reply.get("start"):
-        print("start hash   %s" % reply["start"])
-        print("fingerprint  %s" % reply["fingerprint"])
-        print("entries      up to %s, epoch %s, boot %s" % (reply["seq"], reply["epoch"], reply["boot"]))
-        print("operating    %.1f days" % (reply["op"] / 86400))
-        print("healthy      %s%s" % (reply["healthy"], (" - " + reply["fault"]) if reply.get("fault") else ""))
+        print(f"start hash   {reply['start']}")
+        print(f"fingerprint  {reply['fingerprint']}")
+        print(f"entries      up to {reply['seq']}, epoch {reply['epoch']}, boot {reply['boot']}")
+        print(f"operating    {reply['op'] / 86400:.1f} days")
+        print(f"healthy      {reply['healthy']}{(' - ' + reply['fault']) if reply.get('fault') else ''}")
         for cls in list(al.CLASSES) + ["reserve"]:
             used = reply["used"].get(cls, 0)
             share = reply["shares"].get(cls, 0)
-            print("  %-10s %10d of %10d bytes (%.2f %%)" % (cls, used, share, 100.0 * used / share if share else 0))
+            print(f"  {cls!s:<10} {used:10d} of {share:10d} bytes ({100.0 * used / share if share else 0:.2f} %)")
         if reply.get("summaries"):
-            print("summaries    open for %s" % ", ".join(reply["summaries"]))
+            print(f"summaries    open for {', '.join(reply['summaries'])}")
     return 0 if reply.get("mode") == "log" and reply.get("healthy") else 2
 
 
@@ -318,13 +316,13 @@ def cmd_reset(args):
     try:
         reply, _ = request({"cmd": "reset", "reason": args.reason, "actor": actor})
     except Unreachable as exc:
-        print("mp-audit: %s" % exc, file=sys.stderr)
+        print(f"mp-audit: {exc}", file=sys.stderr)
         return 1
     if not reply.get("ok"):
-        print("mp-audit: %s" % reply.get("error"), file=sys.stderr)
+        print(f"mp-audit: {reply.get('error')}", file=sys.stderr)
         return 2
-    print("new log, start hash %s" % reply["start"])
-    print("fingerprint  %s" % reply["fingerprint"])
+    print(f"new log, start hash {reply['start']}")
+    print(f"fingerprint  {reply['fingerprint']}")
     print("The new start hash goes into the ERP, the operating manual and next to the nameplate (AL-58).")
     return 0
 

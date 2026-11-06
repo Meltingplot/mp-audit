@@ -23,6 +23,7 @@ it that concerns the log is recomputed from the lines written after the
 position it names, and the whole log is read when it is missing.
 """
 
+import ctypes
 import hashlib
 import json
 import os
@@ -63,6 +64,7 @@ TRACK = 32  # counted to find them (space-saving)
 TOP_LEN = 40
 PENDING_MAX = 10000  # entries held while the partition cannot be written
 SEAL_COST = 300  # bytes of a seal, charged to whoever caused it
+FIELD_LIMITS = {"actor": 64, "via": 32, "obj": 256, "msg": 256}  # of an entry, bounded (AL-02)
 
 
 class Clock:
@@ -91,8 +93,6 @@ def clock_synced():
     clients (timesyncd on the printer SBC, chrony on the panel) report it:
     adjtimex answers TIME_ERROR (5) while it is not."""
     try:
-        import ctypes
-
         libc = ctypes.CDLL(None, use_errno=True)
         buf = ctypes.create_string_buffer(512)  # struct timex, modes = 0
         return libc.adjtimex(buf) not in (-1, 5)
@@ -213,7 +213,7 @@ class AuditCore:
     """The log of this computer. Thread safe: every public method takes the
     lock, so the socket threads of the service can record concurrently."""
 
-    def __init__(self, root, ident, clock=None, journal=None, shares=None, append_only=True):
+    def __init__(self, root, ident, clock=None, journal=None, append_only=True):
         self.root = root
         self.own = os.path.join(root, "own")
         self.logdir = os.path.join(self.own, "log")
@@ -222,7 +222,7 @@ class AuditCore:
         self.ident = ident
         self.clock = clock or Clock()
         self.journal = journal or (lambda e, note=None: None)
-        self.shares = dict(shares or SHARES)
+        self.shares = dict(SHARES)
         self.append_only = append_only
         self.lock = threading.RLock()
         self.stats = {"bytes": 0, "fsyncs": 0, "flushes": 0}
@@ -273,7 +273,7 @@ class AuditCore:
     # --- files -----------------------------------------------------------------
 
     def _segpath(self, n):
-        return os.path.join(self.logdir, "%08d.jsonl" % n)
+        return os.path.join(self.logdir, f"{n:08d}.jsonl")
 
     def segments(self):
         try:
@@ -296,7 +296,7 @@ class AuditCore:
         try:
             subprocess.run(["chattr", flag, path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except (OSError, subprocess.CalledProcessError):
-            self.notes.append(("chattr", "cannot set %s on %s" % (flag, path)))
+            self.notes.append(("chattr", f"cannot set {flag} on {path}"))
 
     def _append(self, data):
         path = self._segpath(self.seg)
@@ -374,7 +374,7 @@ class AuditCore:
     # --- keys ------------------------------------------------------------------
 
     def _keypath(self, n):
-        return os.path.join(self.keydir, "epoch-%d.key" % n)
+        return os.path.join(self.keydir, f"epoch-{n}.key")
 
     def _store_key(self, n, key):
         path = self._keypath(n)
@@ -443,7 +443,7 @@ class AuditCore:
         self.key = key
         self.epoch_op = self.op()
         self._wipe_keys_except(self._keypath(self.epoch))
-        self.notes.append(("rekey", "key of epoch %d lost; it cannot be sealed" % old))
+        self.notes.append(("rekey", f"key of epoch {old} lost; it cannot be sealed"))
 
     # --- state -----------------------------------------------------------------
 
@@ -522,66 +522,75 @@ class AuditCore:
             segs = self.segments()
             if not segs or all(os.path.getsize(self._segpath(s)) == 0 for s in segs):
                 if st and st.get("start"):
-                    self.notes.append(("missing", "the log of start hash %s is gone" % st["start"]))
+                    self.notes.append(("missing", f"the log of start hash {st['start']} is gone"))
                 self._boots(st)
                 self.extra = (st or {}).get("extra", {})
                 self.seg = 1
                 return "new"
-
-            known = st and st.get("seg") in segs and st.get("off", 0) <= os.path.getsize(self._segpath(st["seg"]))
-            if known:
-                self.start = st["start"]
-                self.next_seq = st["seq"]
-                self.acc = st["acc"]
-                self.seg, self.off = st["seg"], st["off"]
-                self.prev = st["prev"]
-                self.epoch, self.pub = st["epoch"], st["pub"]
-                self.unsealed = st["unsealed"]
-                self.last_ev = st["last_ev"]
-                self.used.update(st["used"])
-                for c, (tokens, op) in st["buckets"].items():
-                    if c in self.buckets:
-                        self.buckets[c].tokens, self.buckets[c].op = tokens, op
-                self.summaries = {k: Summary.from_json(v) for k, v in st["summaries"].items()}
-                self.extra = st.get("extra", {})
-            else:
-                if st:
-                    # A log shorter than the state remembers was cut off
-                    # from outside; worth an entry either way.
-                    self.notes.append(("state", "state file does not match the log, log read in full"))
-                    self.extra = st.get("extra", {})
-                else:
-                    self.notes.append(("state", "state file missing, log read in full"))
-                self.seg, self.off = segs[0], 0
+            self._restore(st, segs)
             self._scan(segs)
-
             self._boots(st)
             self.epoch_op = self.op()
-
-            seen = []
-            if not self.prev_clean and self.prev_bid and recover:
-                seen = recover(self.prev_bid, self.next_seq)
-            known = max([self.next_seq - 1] + [seq for seq, _ in seen])
-            counted = self.acc + sum(s.n for s in self.summaries.values())
-            self.lost = max(0, known - counted)
-            self.recovered = seen
-            self.next_seq = known + 1
-
-            # Right after the unreadable rest of a crashed write, before
-            # anything else, so the check can step over it.
-            if self.torn:
-                n, h = self.torn
-                self.record(
-                    "E17",
-                    "info",
-                    force=True,
-                    msg="incomplete line at the end of the log, left by a crash",
-                    data={"torn": n, "torn_sha256": h},
-                )
-                self.flush()
+            self._count_lost(recover)
+            self._step_over_torn()
             if not self._load_key():
                 self._rekey()
             return "open"
+
+    def _restore(self, st, segs):
+        """Start from the state file if it fits the log, else from the log."""
+        if st and st.get("seg") in segs and st.get("off", 0) <= os.path.getsize(self._segpath(st["seg"])):
+            self._load_counters(st)
+            return
+        if st:
+            # A log shorter than the state remembers was cut off
+            # from outside; worth an entry either way.
+            self.notes.append(("state", "state file does not match the log, log read in full"))
+            self.extra = st.get("extra", {})
+        else:
+            self.notes.append(("state", "state file missing, log read in full"))
+        self.seg, self.off = segs[0], 0
+
+    def _load_counters(self, st):
+        self.start = st["start"]
+        self.next_seq = st["seq"]
+        self.acc = st["acc"]
+        self.seg, self.off = st["seg"], st["off"]
+        self.prev = st["prev"]
+        self.epoch, self.pub = st["epoch"], st["pub"]
+        self.unsealed = st["unsealed"]
+        self.last_ev = st["last_ev"]
+        self.used.update(st["used"])
+        for c, (tokens, op) in st["buckets"].items():
+            if c in self.buckets:
+                self.buckets[c].tokens, self.buckets[c].op = tokens, op
+        self.summaries = {k: Summary.from_json(v) for k, v in st["summaries"].items()}
+        self.extra = st.get("extra", {})
+
+    def _count_lost(self, recover):
+        """The numbers a crash left unaccounted, and what the journal still has of them."""
+        seen = []
+        if not self.prev_clean and self.prev_bid and recover:
+            seen = recover(self.prev_bid, self.next_seq)
+        known = max([self.next_seq - 1] + [seq for seq, _ in seen])
+        counted = self.acc + sum(s.n for s in self.summaries.values())
+        self.lost = max(0, known - counted)
+        self.recovered = seen
+        self.next_seq = known + 1
+
+    def _step_over_torn(self):
+        """Right after the unreadable rest of a crashed write, before
+        anything else, so the check can step over it."""
+        if self.torn:
+            n, h = self.torn
+            self.record(
+                "E17",
+                "info",
+                force=True,
+                msg="incomplete line at the end of the log, left by a crash",
+                data={"torn": n, "torn_sha256": h},
+            )
+            self.flush()
 
     def _boots(self, st):
         """Boot counter and operating time (AL-49). A new boot starts from
@@ -604,48 +613,57 @@ class AuditCore:
         """Read the lines after the known position into the counters."""
         self.torn = None
         for s in segs:
-            if s < self.seg:
-                continue
-            path = self._segpath(s)
-            with open(path, "rb") as f:
-                f.seek(self.off if s == self.seg else 0)
-                data = f.read()
-            if s != self.seg:
-                self.seg, self.off = s, 0
-            pos = 0
-            while pos < len(data):
-                end = data.find(b"\n", pos)
-                complete = end >= 0
-                raw = data[pos:end] if complete else data[pos:]
-                text = raw.decode("utf-8", "surrogateescape")
-                try:
-                    obj = json.loads(text) if raw.strip(b"\0") else None
-                    if not isinstance(obj, dict):
-                        raise ValueError
-                except ValueError:
-                    obj = None
-                if obj is None or not complete:
-                    if raw:
-                        # Only a crash in the middle of a write leaves this,
-                        # and only at the end. Not chained into anything.
-                        self.torn = (len(raw), al.line_hash(text))
-                        self.need_newline = not complete
-                    pos = (end + 1) if complete else len(data)
-                    self.off += len(raw) + (1 if complete else 0)
-                    continue
-                self.torn = None
-                if self.start is None:
-                    self.start = al.line_hash(text)
-                self._account(obj, len(raw) + 1, debit=True)
-                self.prev = al.line_hash(text)
-                pos = end + 1
-                self.off += len(raw) + 1
+            if s >= self.seg:
+                self._scan_segment(s)
         if self.torn is None:
             self.need_newline = False
 
+    def _scan_segment(self, s):
+        with open(self._segpath(s), "rb") as f:
+            f.seek(self.off if s == self.seg else 0)
+            data = f.read()
+        if s != self.seg:
+            self.seg, self.off = s, 0
+        pos = 0
+        while pos < len(data):
+            end = data.find(b"\n", pos)
+            complete = end >= 0
+            self._scan_line(data[pos:end] if complete else data[pos:], complete)
+            pos = (end + 1) if complete else len(data)
+
+    def _scan_line(self, raw, complete):
+        text = raw.decode("utf-8", "surrogateescape")
+        obj = self._parse_line(raw, text)
+        if obj is None or not complete:
+            if raw:
+                # Only a crash in the middle of a write leaves this,
+                # and only at the end. Not chained into anything.
+                self.torn = (len(raw), al.line_hash(text))
+                self.need_newline = not complete
+            self.off += len(raw) + (1 if complete else 0)
+            return
+        self.torn = None
+        if self.start is None:
+            self.start = al.line_hash(text)
+        self._account(obj, len(raw) + 1, debit=True)
+        self.prev = al.line_hash(text)
+        self.off += len(raw) + 1
+
+    @staticmethod
+    def _parse_line(raw, text):
+        try:
+            obj = json.loads(text) if raw.strip(b"\0") else None
+        except ValueError:
+            return None
+        return obj if isinstance(obj, dict) else None
+
     # --- entries ---------------------------------------------------------------
 
-    def _entry(self, ev, res, actor="", via="", obj="", msg="", data=None):
+    def _entry(self, ev, res, data=None, **fields):
+        """A new entry, with its number. fields are those of FIELD_LIMITS."""
+        unknown = fields.keys() - FIELD_LIMITS.keys()
+        if unknown:
+            raise TypeError(f"unknown fields {sorted(unknown)}")
         idt = self.ident()
         e = {
             "seq": self.next_seq,
@@ -662,14 +680,9 @@ class AuditCore:
             "cls": al.class_of(ev, res) if res != al.AGGREGATED else None,
             "res": res,
         }
-        if actor:
-            e["actor"] = al.clean(actor, 64)
-        if via:
-            e["via"] = al.clean(via, 32)
-        if obj:
-            e["obj"] = al.clean(obj, 256)
-        if msg:
-            e["msg"] = al.clean(msg, 256)
+        for name, limit in FIELD_LIMITS.items():
+            if fields.get(name):
+                e[name] = al.clean(fields[name], limit)
         if data:
             e["data"] = al.clean_data(data)
         self.next_seq += 1
@@ -699,8 +712,9 @@ class AuditCore:
             self.save_state()
             return self.start
 
-    def record(self, ev, res, actor="", via="", obj="", msg="", data=None, sync=False, force=False):
-        """Accept one event. Returns its sequence number.
+    def record(self, ev, res, *, sync=False, force=False, **fields):
+        """Accept one event. Returns its sequence number. fields are data and
+        those of FIELD_LIMITS.
 
         Attempts and operation are written at the next flush, within five
         seconds (AL-51). Changes are written before this returns, so a power
@@ -710,11 +724,11 @@ class AuditCore:
         Over the budget of its class it is counted in a summary instead
         (AL-41)."""
         if ev not in al.EVENTS:
-            raise ValueError("unknown event %r" % ev)
+            raise ValueError(f"unknown event {ev!r}")
         if res not in al.RESULTS:
-            raise ValueError("unknown result %r" % res)
+            raise ValueError(f"unknown result {res!r}")
         with self.lock:
-            e = self._entry(ev, res, actor, via, obj, msg, data)
+            e = self._entry(ev, res, **fields)
             cls = e["cls"]
             op = self.op()
             key = cls + "/" + ev
@@ -764,7 +778,7 @@ class AuditCore:
                 "E19",
                 "info",
                 obj=key,
-                msg="%s over the budget of class %s, counted in a summary" % (ev, cls),
+                msg=f"{ev} over the budget of class {cls}, counted in a summary",
                 data={"class": cls, "event": ev, "from": e["seq"]},
             )
 
@@ -775,7 +789,7 @@ class AuditCore:
             s = self.summaries[key]
             if not force and not s.due(op):
                 continue
-            e = self._entry(s.ev, al.AGGREGATED, msg="%d events counted" % s.n)
+            e = self._entry(s.ev, al.AGGREGATED, msg=f"{s.n} events counted")
             e["cls"] = s.cls
             e["agg"] = s.agg()
             cost = self._cost(e)
@@ -803,7 +817,7 @@ class AuditCore:
         lost = self.pending[PENDING_MAX // 2 :]
         del self.pending[PENDING_MAX // 2 :]
         e = self._entry(
-            "E17", "failed", msg="audit log not writable, %d entries lost" % len(lost), data={"lost": len(lost)}
+            "E17", "failed", msg=f"audit log not writable, {len(lost)} entries lost", data={"lost": len(lost)}
         )
         self.pending.append(e)
         self.journal(e)
@@ -973,7 +987,7 @@ class AuditCore:
             stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
             archive = os.path.join(self.root, "archive")
             os.makedirs(archive, exist_ok=True)
-            os.rename(self.own, os.path.join(archive, "%s-%s" % (stamp, (self.start or "none")[:16])))
+            os.rename(self.own, os.path.join(archive, f"{stamp}-{(self.start or 'none')[:16]}"))
             self._fsync_dir(archive)
             self._fsync_dir(self.root)
             self._reset_memory()
